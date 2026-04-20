@@ -1,0 +1,14 @@
+{
+  "name": "yak",
+  "version": "0.1.0",
+  "description": "Workflow/runtime plugin for opencode",
+  "type": "module",
+  "license": "MIT",
+  "engines": { "node": ">=18" },
+  "scripts": {
+    "test": "node --test tests/planning-files/*.test.mjs",
+    "install:link": "./install.sh --link",
+    "install:copy": "./install.sh --copy",
+    "uninstall": "./uninstall.sh"
+  }
+}

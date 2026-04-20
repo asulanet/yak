@@ -1,0 +1,30 @@
+{
+  "workflow": {
+    "enabled": true,
+    "root": ".agents/artifacts/planning",
+    "heartbeat_interval_ms": 5000,
+    "stale_after_ms": 30000,
+    "enforce_stage_gates": true,
+    "readonly_shell_allowlist": [
+      "ls",
+      "find",
+      "rg",
+      "grep",
+      "cat",
+      "sed -n",
+      "git status",
+      "git diff --name-only"
+    ],
+    "task_complexity_routes": {
+      "low": "orchestrator",
+      "medium": "council:medium-review",
+      "high": "oracle"
+    },
+    "review_presets": {
+      "medium": "medium-review",
+      "high": "oracle-high-review"
+    },
+    "session_naming": "timestamp-slug-random6",
+    "repo_write_lease": true
+  }
+}

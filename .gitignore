@@ -1,0 +1,4 @@
+node_modules/
+.yak-backup-*/
+*.log
+.DS_Store

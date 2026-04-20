@@ -1,0 +1,13 @@
+// Project-level yak config. Place at <repo>/.opencode/yak.jsonc.
+// Overrides user-level ~/.config/opencode/yak.jsonc for this repo.
+// Uses the current `workflow` schema (not legacy `planning`).
+{
+  "workflow": {
+    "root": ".agents/yak/projects",
+    "task_complexity_routes": {
+      "low": "orchestrator",
+      "medium": "council:medium-review",
+      "high": "oracle"
+    }
+  }
+}
