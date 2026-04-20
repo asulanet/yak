@@ -1,6 +1,32 @@
 # Strict Workflow
 
-Three phases. No shortcuts.
+Four phase states. Phase 0 is permissive; Phases 1-3 are strict.
+
+## Phase 0: exploration (default for new projects)
+
+- New projects bootstrap with `phase: phase0_exploration`, `subphase: idle`, `stage: exploration`.
+- No workflow restrictions active — the tool layer only blocks hard-protected paths (`.git`, `.env*`) and a short list of destructive shell commands (`git push`, package installs, `terraform apply`, mutating `gh` commands, etc.).
+- The orchestrator is told to behave like a normal OpenCode session and to proactively offer "yak it" when the user's request is substantial (multi-step features, refactors, architectural changes, unclear-root-cause debugging).
+
+### Entering strict mode
+
+Users move into Phase 1 via one of these trigger phrases (case-insensitive, detected in chat messages):
+
+- `/yak`
+- `yak it`
+- `yak this`
+- `yak this project`
+- `yak the project`
+- `yak project`
+- `let's yak`
+
+On trigger, the runtime updates `project.md` frontmatter to `phase: phase1_discovery`, `subphase: scope_draft`, `stage: planning` and appends a progress line. Strict constraints apply from the next turn.
+
+### Exiting strict mode
+
+Users can leave strict mode via `unyak`, `stop yak`, `exit yak`, or `/unyak`. The project returns to `phase0_exploration`.
+
+Programmatic helpers `activateYakForSession(sessionID)` and `deactivateYakForSession(sessionID)` are exposed on the plugin for scripted toggling.
 
 ## Phase 1: discovery / research / plan shaping
 
@@ -37,6 +63,18 @@ Use one-by-one for tight coupling or high risk. Use approve-all only when tasks 
 - Execute only snapshot tasks.
 - No new-task rule: discoveries become follow-up backlog items, not live execution scope.
 - If scope changes materially, reopen an earlier phase instead of mutating the snapshot in place.
+
+### Stage recording (dispatch-lifecycle)
+
+Only the orchestrator records task stages. Subagents never do — their system prompt forbids it, and the `yak_task_stage` tool rejects non-orchestrator callers.
+
+| Transition | Who | How |
+|---|---|---|
+| `approved -> dispatched` | runtime | auto on `task` / `background_task` tool fire |
+| `dispatched -> reported` | runtime | auto on `task` / `background_task` tool return |
+| every other transition | orchestrator | call the `yak_task_stage` tool with `{ task_id, stage, note? }` |
+
+The `node yak/scripts/record-task-stage.mjs` CLI is retained for humans, CI, and migration scripts. LLM sessions (orchestrator included) should use the `yak_task_stage` tool instead.
 
 ## Task contract frontmatter
 

@@ -1,9 +1,9 @@
 ---
 project_slug: {{ACTIVE_PROJECT_SLUG}}
 project_dir: {{PROJECT_DIR}}
-stage: planning
-phase: phase1_discovery
-subphase: discovery
+stage: exploration
+phase: phase0_exploration
+subphase: idle
 phase1_revision: 1
 phase1_approved_revision: null
 phase2_revision: 0

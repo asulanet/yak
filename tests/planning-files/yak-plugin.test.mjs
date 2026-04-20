@@ -286,7 +286,12 @@ test('default slug bootstraps missing project md in single-project repo', async 
     const plugin = await PlanningFilesPlugin({ directory: repoRoot })
     await plugin.event({ event: { type: 'session.created', properties: { info: { id: 'session-default-missing' } } } })
     const { frontmatter } = readMarkdownFrontmatter(path.join(projectDir, 'project.md'))
-    assert.equal(frontmatter.stage, 'planning')
+    // Fresh projects bootstrap into Phase 0 exploration so the initial
+    // conversation stays lightweight. User must explicitly "yak it" to move
+    // into strict Phase 1 planning.
+    assert.equal(frontmatter.stage, 'exploration')
+    assert.equal(frontmatter.phase, 'phase0_exploration')
+    assert.equal(frontmatter.subphase, 'idle')
     assert.ok(fs.existsSync(path.join(projectDir, 'context.md')))
     assert.ok(fs.existsSync(path.join(projectDir, 'tasks.md')))
   })
@@ -318,7 +323,10 @@ test('active pointer bootstraps selected incomplete slug in multi-project repo',
     const plugin = await PlanningFilesPlugin({ directory: repoRoot })
     await plugin.event({ event: { type: 'session.created', properties: { info: { id: 'session-active-missing' } } } })
     const { frontmatter } = readMarkdownFrontmatter(path.join(projectRoot, 'beta', 'project.md'))
-    assert.equal(frontmatter.stage, 'planning')
+    // Newly bootstrapped projects default to Phase 0 exploration regardless of
+    // whether a sibling project has already been initialized.
+    assert.equal(frontmatter.stage, 'exploration')
+    assert.equal(frontmatter.phase, 'phase0_exploration')
     assert.ok(fs.existsSync(path.join(projectRoot, 'beta', 'context.md')))
     assert.ok(fs.existsSync(path.join(projectRoot, 'beta', 'tasks.md')))
   })
@@ -927,5 +935,444 @@ test('implementation mode scopes lsp_rename and ast_grep_replace by session role
     await assert.rejects(async () => {
       await plugin['tool.execute.before']({ sessionID: 'worker', tool: 'ast_grep_replace' }, { args: { paths: ['src/private/secret.ts'] } })
     }, /Task write touches forbidden path:|Task write outside allowed paths:/)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Phase 0 (exploration) behavior
+// ---------------------------------------------------------------------------
+
+test('phase 0 exploration is permissive: write, edit and shell work without task policy', async () => {
+  const repoRoot = makeRepo(); const configRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'yak-config-'))
+  await withEnv({ OPENCODE_CONFIG_DIR: configRoot, XDG_CONFIG_HOME: '' }, async () => {
+    const plugin = await PlanningFilesPlugin({ directory: repoRoot })
+    await plugin.event({ event: { type: 'session.created', properties: { info: { id: 'session-explore' } } } })
+    fs.writeFileSync(path.join(repoRoot, 'src.js'), 'x')
+
+    // Write to a random repo file — would be denied in Phase 1 planning,
+    // should succeed in Phase 0.
+    await assert.doesNotReject(async () => {
+      await plugin['tool.execute.before']({ sessionID: 'session-explore', tool: 'write' }, { args: { filePath: path.join(repoRoot, 'src.js'), content: 'y' } })
+    })
+
+    // Read-only shell still works.
+    await assert.doesNotReject(async () => {
+      await plugin['tool.execute.before']({ sessionID: 'session-explore', tool: 'shell' }, { args: { command: 'ls' } })
+    })
+
+    // mkdir outside the planning dir works in exploration.
+    await assert.doesNotReject(async () => {
+      await plugin['tool.execute.before']({ sessionID: 'session-explore', tool: 'mkdir' }, { args: { path: path.join(repoRoot, 'new-dir') } })
+    })
+  })
+})
+
+test('phase 0 exploration still hard-blocks protected paths and destructive shell forms', async () => {
+  const repoRoot = makeRepo(); const configRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'yak-config-'))
+  await withEnv({ OPENCODE_CONFIG_DIR: configRoot, XDG_CONFIG_HOME: '' }, async () => {
+    const plugin = await PlanningFilesPlugin({ directory: repoRoot })
+    await plugin.event({ event: { type: 'session.created', properties: { info: { id: 'session-explore' } } } })
+
+    await assert.rejects(async () => {
+      await plugin['tool.execute.before']({ sessionID: 'session-explore', tool: 'write' }, { args: { filePath: path.join(repoRoot, '.env'), content: 'SECRET=1' } })
+    }, /protected|env/i)
+
+    await assert.rejects(async () => {
+      await plugin['tool.execute.before']({ sessionID: 'session-explore', tool: 'shell' }, { args: { command: 'git push origin HEAD' } })
+    }, /destructive|exploration denies/i)
+  })
+})
+
+test('phase 0 apply_patch allows repo edits but blocks protected and escaping paths', async () => {
+  const repoRoot = makeRepo(); const configRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'yak-config-'))
+  await withEnv({ OPENCODE_CONFIG_DIR: configRoot, XDG_CONFIG_HOME: '' }, async () => {
+    const plugin = await PlanningFilesPlugin({ directory: repoRoot })
+    await plugin.event({ event: { type: 'session.created', properties: { info: { id: 'session-explore' } } } })
+
+    await assert.doesNotReject(async () => {
+      await plugin['tool.execute.before']({ sessionID: 'session-explore', tool: 'apply_patch' }, { args: { patchText: '*** Begin Patch\n*** Add File: src/new.js\n+hi\n*** End Patch' } })
+    })
+
+    await assert.rejects(async () => {
+      await plugin['tool.execute.before']({ sessionID: 'session-explore', tool: 'apply_patch' }, { args: { patchText: '*** Begin Patch\n*** Update File: ../escape.js\n+hi\n*** End Patch' } })
+    }, /escape/i)
+
+    await assert.rejects(async () => {
+      await plugin['tool.execute.before']({ sessionID: 'session-explore', tool: 'apply_patch' }, { args: { patchText: '*** Begin Patch\n*** Update File: .env\n+hi\n*** End Patch' } })
+    }, /protected|env/i)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// "yak it" / "unyak" triggers
+// ---------------------------------------------------------------------------
+
+test('yak activation trigger transitions phase 0 exploration to phase 1 discovery', async () => {
+  const repoRoot = makeRepo(); const configRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'yak-config-'))
+  await withEnv({ OPENCODE_CONFIG_DIR: configRoot, XDG_CONFIG_HOME: '' }, async () => {
+    const plugin = await PlanningFilesPlugin({ directory: repoRoot })
+    await plugin.event({ event: { type: 'session.created', properties: { info: { id: 'session-trigger' } } } })
+    const projectRoot = path.join(repoRoot, '.agents', 'yak', 'projects')
+    const slug = fs.readdirSync(projectRoot).find((entry) => fs.statSync(path.join(projectRoot, entry)).isDirectory())
+    const projectPath = path.join(projectRoot, slug, 'project.md')
+
+    // Confirm starting state is exploration.
+    assert.equal(readMarkdownFrontmatter(projectPath).frontmatter.stage, 'exploration')
+
+    await plugin['experimental.chat.messages.transform']({}, { messages: [
+      { info: { id: 'user-1', sessionID: 'session-trigger', role: 'user' }, parts: [{ type: 'text', text: 'cool, now yak this project please' }] },
+    ] })
+
+    const fm = readMarkdownFrontmatter(projectPath).frontmatter
+    assert.equal(fm.phase, 'phase1_discovery')
+    assert.equal(fm.subphase, 'scope_draft')
+    assert.equal(fm.stage, 'planning')
+    const progress = fs.readFileSync(path.join(projectRoot, slug, 'progress.md'), 'utf8')
+    assert.match(progress, /Yak activated by user trigger/)
+  })
+})
+
+test('yak activation trigger variants all fire once per message', async () => {
+  const repoRoot = makeRepo(); const configRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'yak-config-'))
+  await withEnv({ OPENCODE_CONFIG_DIR: configRoot, XDG_CONFIG_HOME: '' }, async () => {
+    for (const phrase of ['yak it', 'yak this', 'yak the project', 'yak project', "let's yak", '/yak']) {
+      const variantRepo = fs.mkdtempSync(path.join(os.tmpdir(), 'yak-variant-')); execFileSync('git', ['init'], { cwd: variantRepo, stdio: 'ignore' })
+      const plugin = await PlanningFilesPlugin({ directory: variantRepo })
+      await plugin.event({ event: { type: 'session.created', properties: { info: { id: `variant-${phrase}` } } } })
+      const projectRoot = path.join(variantRepo, '.agents', 'yak', 'projects')
+      const slug = fs.readdirSync(projectRoot).find((entry) => fs.statSync(path.join(projectRoot, entry)).isDirectory())
+      const projectPath = path.join(projectRoot, slug, 'project.md')
+
+      await plugin['experimental.chat.messages.transform']({}, { messages: [
+        { info: { id: `u-${phrase}`, sessionID: `variant-${phrase}`, role: 'user' }, parts: [{ type: 'text', text: `hey ${phrase}` }] },
+      ] })
+
+      const fm = readMarkdownFrontmatter(projectPath).frontmatter
+      assert.equal(fm.phase, 'phase1_discovery', `phrase "${phrase}" should activate yak`)
+    }
+  })
+})
+
+test('yak deactivation trigger returns project to exploration', async () => {
+  const repoRoot = makeRepo(); const configRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'yak-config-'))
+  await withEnv({ OPENCODE_CONFIG_DIR: configRoot, XDG_CONFIG_HOME: '' }, async () => {
+    const plugin = await PlanningFilesPlugin({ directory: repoRoot })
+    await plugin.event({ event: { type: 'session.created', properties: { info: { id: 'session-deact' } } } })
+    const projectRoot = path.join(repoRoot, '.agents', 'yak', 'projects')
+    const slug = fs.readdirSync(projectRoot).find((entry) => fs.statSync(path.join(projectRoot, entry)).isDirectory())
+    const projectPath = path.join(projectRoot, slug, 'project.md')
+
+    // Activate first.
+    await plugin['experimental.chat.messages.transform']({}, { messages: [
+      { info: { id: 'u-act', sessionID: 'session-deact', role: 'user' }, parts: [{ type: 'text', text: 'yak it' }] },
+    ] })
+    assert.equal(readMarkdownFrontmatter(projectPath).frontmatter.phase, 'phase1_discovery')
+
+    // Deactivate.
+    await plugin['experimental.chat.messages.transform']({}, { messages: [
+      { info: { id: 'u-deact', sessionID: 'session-deact', role: 'user' }, parts: [{ type: 'text', text: 'stop yak, back to browsing' }] },
+    ] })
+    const fm = readMarkdownFrontmatter(projectPath).frontmatter
+    assert.equal(fm.phase, 'phase0_exploration')
+    assert.equal(fm.stage, 'exploration')
+    assert.equal(fm.subphase, 'idle')
+  })
+})
+
+test('yak trigger is a no-op when project is already in strict phase', async () => {
+  const repoRoot = makeRepo(); const configRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'yak-config-'))
+  await withEnv({ OPENCODE_CONFIG_DIR: configRoot, XDG_CONFIG_HOME: '' }, async () => {
+    const plugin = await PlanningFilesPlugin({ directory: repoRoot })
+    await plugin.event({ event: { type: 'session.created', properties: { info: { id: 'session-noop' } } } })
+    const projectRoot = path.join(repoRoot, '.agents', 'yak', 'projects')
+    const slug = fs.readdirSync(projectRoot).find((entry) => fs.statSync(path.join(projectRoot, entry)).isDirectory())
+    const projectPath = path.join(projectRoot, slug, 'project.md')
+    fs.writeFileSync(projectPath, '---\nphase: "phase2_tasks"\nsubphase: "task_graph_draft"\nstage: "planning"\n---\n')
+
+    await plugin['experimental.chat.messages.transform']({}, { messages: [
+      { info: { id: 'u-act', sessionID: 'session-noop', role: 'user' }, parts: [{ type: 'text', text: 'yak it' }] },
+    ] })
+
+    const fm = readMarkdownFrontmatter(projectPath).frontmatter
+    assert.equal(fm.phase, 'phase2_tasks')
+    assert.equal(fm.subphase, 'task_graph_draft')
+  })
+})
+
+test('activateYakForSession / deactivateYakForSession helpers round-trip phase', async () => {
+  const repoRoot = makeRepo(); const configRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'yak-config-'))
+  await withEnv({ OPENCODE_CONFIG_DIR: configRoot, XDG_CONFIG_HOME: '' }, async () => {
+    const plugin = await PlanningFilesPlugin({ directory: repoRoot })
+    await plugin.event({ event: { type: 'session.created', properties: { info: { id: 'session-helper' } } } })
+
+    const activated = plugin.activateYakForSession('session-helper', { reason: 'programmatic test' })
+    assert.equal(activated.activated, true)
+    assert.equal(activated.phase, 'phase1_discovery')
+
+    // Second activation is a no-op.
+    const again = plugin.activateYakForSession('session-helper')
+    assert.equal(again.activated, false)
+    assert.equal(again.reason, 'already_active')
+
+    const deactivated = plugin.deactivateYakForSession('session-helper', { reason: 'cleanup' })
+    assert.equal(deactivated.deactivated, true)
+    assert.equal(deactivated.phase, 'phase0_exploration')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// system.transform: bootstrap fix + directive injection at top
+// ---------------------------------------------------------------------------
+
+test('system.transform bootstraps runtime session when missing and injects Yak block at top', async () => {
+  const repoRoot = makeRepo(); const configRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'yak-config-'))
+  await withEnv({ OPENCODE_CONFIG_DIR: configRoot, XDG_CONFIG_HOME: '' }, async () => {
+    const plugin = await PlanningFilesPlugin({ directory: repoRoot })
+
+    // Deliberately SKIP session.created. system.transform should still
+    // bootstrap the runtime session lazily and inject Yak system text.
+    const out = { system: ['baseline system message from core'] }
+    await plugin['experimental.chat.system.transform']({ sessionID: 'fresh-session' }, out)
+
+    assert.ok(out.system.length >= 2, 'expected at least one additional Yak system message')
+    assert.match(out.system[0], /\[YAK\]/)
+    // Core baseline must still be present after the Yak block.
+    assert.ok(out.system.includes('baseline system message from core'))
+  })
+})
+
+test('system.transform emits Phase 0 directive in exploration and strict directive after activation', async () => {
+  const repoRoot = makeRepo(); const configRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'yak-config-'))
+  await withEnv({ OPENCODE_CONFIG_DIR: configRoot, XDG_CONFIG_HOME: '' }, async () => {
+    const plugin = await PlanningFilesPlugin({ directory: repoRoot })
+    await plugin.event({ event: { type: 'session.created', properties: { info: { id: 'session-directive' } } } })
+
+    const phase0Out = { system: [] }
+    await plugin['experimental.chat.system.transform']({ sessionID: 'session-directive' }, phase0Out)
+    assert.match(phase0Out.system[0], /phase0|exploration/i)
+    assert.match(phase0Out.system[0], /yak it|\/yak/i)
+
+    // Activate Yak.
+    plugin.activateYakForSession('session-directive')
+
+    const phase1Out = { system: [] }
+    await plugin['experimental.chat.system.transform']({ sessionID: 'session-directive' }, phase1Out)
+    assert.match(phase1Out.system[0], /STRICT MODE/)
+    assert.match(phase1Out.system[0], /phase1_discovery/)
+    // Strict-only reminders should also be present now. Stage-recording instructions
+    // are now orchestrator-scoped and reference the yak_task_stage tool (not node CLI).
+    assert.ok(phase1Out.system.some((msg) => /yak_task_stage|auto-recorded/i.test(msg)))
+    assert.ok(!phase1Out.system.some((msg) => /node\s+\S*record-task-stage\.mjs/i.test(msg)))
+  })
+})
+
+test('system.transform skips strict extras in phase 0 to keep prompt lightweight', async () => {
+  const repoRoot = makeRepo(); const configRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'yak-config-'))
+  fs.writeFileSync(path.join(repoRoot, 'AGENTS.md'), '# repo rules')
+  await withEnv({ OPENCODE_CONFIG_DIR: configRoot, XDG_CONFIG_HOME: '' }, async () => {
+    const plugin = await PlanningFilesPlugin({ directory: repoRoot })
+    await plugin.event({ event: { type: 'session.created', properties: { info: { id: 'session-light' } } } })
+
+    const out = { system: [] }
+    await plugin['experimental.chat.system.transform']({ sessionID: 'session-light' }, out)
+    // Phase 0 should not push the strict-only messages.
+    assert.ok(!out.system.some((msg) => /read and follow repo-local AGENTS.md/i.test(msg)))
+    assert.ok(!out.system.some((msg) => /yak_task_stage|record every task stage transition|record-task-stage\.mjs/i.test(msg)))
+    assert.ok(!out.system.some((msg) => /Yak navigator: end meaningful replies/i.test(msg)))
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Dispatch-lifecycle auto-recording
+// ---------------------------------------------------------------------------
+
+function seedImplementingProject(repoRoot, taskIds = ['T1']) {
+  const projectRoot = path.join(repoRoot, '.agents', 'yak', 'projects')
+  const slug = fs.readdirSync(projectRoot).find((entry) => fs.statSync(path.join(projectRoot, entry)).isDirectory())
+  const projectDir = path.join(projectRoot, slug)
+  const activeTasksArr = JSON.stringify(taskIds)
+  const approvedTasksArr = JSON.stringify(taskIds)
+  fs.writeFileSync(path.join(projectDir, 'project.md'), `---\nstage: implementing\nactive_tasks: ${activeTasksArr}\nexecution_snapshot_revision: 1\n---\n`)
+  fs.writeFileSync(path.join(projectDir, 'execution-snapshot.md'), `---\nsnapshot_revision: 1\napproved_task_ids: ${approvedTasksArr}\n---\n`)
+  fs.mkdirSync(path.join(projectDir, 'tasks'), { recursive: true })
+  for (const taskId of taskIds) {
+    fs.writeFileSync(path.join(projectDir, 'tasks', `${taskId}.md`), `---\ntask_id: "${taskId}"\nstage: "approved"\nplan_revision: 1\napproved_revision: 1\nallowed_paths: ["src"]\nforbidden_paths: []\nallowed_ephemeral_paths: []\nallowed_shell_command_forms: []\nrequired_for_acceptance: []\n---\n`)
+  }
+  return { projectDir, slug }
+}
+
+test('orchestrator dispatching task tool auto-records dispatched stage for the bound task', async () => {
+  const repoRoot = makeRepo(); const configRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'yak-config-'))
+  await withEnv({ OPENCODE_CONFIG_DIR: configRoot, XDG_CONFIG_HOME: '' }, async () => {
+    const plugin = await PlanningFilesPlugin({ directory: repoRoot })
+    await plugin.event({ event: { type: 'session.created', properties: { info: { id: 'orch' } } } })
+    const { projectDir } = seedImplementingProject(repoRoot, ['T1'])
+
+    await plugin['tool.execute.before']({ sessionID: 'orch', tool: 'task', callID: 'call-dispatch-1' }, { args: { subagent_type: 'fixer', description: 'impl T1', prompt: 'taskID: T1\nExecute the spec at tasks/T1.md' } })
+
+    const { frontmatter } = readMarkdownFrontmatter(path.join(projectDir, 'tasks', 'T1.md'))
+    assert.equal(frontmatter.stage, 'dispatched', 'expected T1 stage to auto-advance to dispatched')
+    const progress = fs.readFileSync(path.join(projectDir, 'progress.md'), 'utf8')
+    assert.match(progress, /Task T1 stage approved -> dispatched/)
+  })
+})
+
+test('orchestrator background_task dispatch also auto-records dispatched', async () => {
+  const repoRoot = makeRepo(); const configRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'yak-config-'))
+  await withEnv({ OPENCODE_CONFIG_DIR: configRoot, XDG_CONFIG_HOME: '' }, async () => {
+    const plugin = await PlanningFilesPlugin({ directory: repoRoot })
+    await plugin.event({ event: { type: 'session.created', properties: { info: { id: 'orch' } } } })
+    const { projectDir } = seedImplementingProject(repoRoot, ['T2'])
+
+    await plugin['tool.execute.before']({ sessionID: 'orch', tool: 'background_task', callID: 'call-dispatch-2' }, { args: { subagent_type: 'fixer', description: 'impl T2', prompt: 'taskID: T2\nDo stuff' } })
+
+    const { frontmatter } = readMarkdownFrontmatter(path.join(projectDir, 'tasks', 'T2.md'))
+    assert.equal(frontmatter.stage, 'dispatched')
+  })
+})
+
+test('task dispatch without taskID does not record any stage', async () => {
+  const repoRoot = makeRepo(); const configRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'yak-config-'))
+  await withEnv({ OPENCODE_CONFIG_DIR: configRoot, XDG_CONFIG_HOME: '' }, async () => {
+    const plugin = await PlanningFilesPlugin({ directory: repoRoot })
+    await plugin.event({ event: { type: 'session.created', properties: { info: { id: 'orch' } } } })
+    const { projectDir } = seedImplementingProject(repoRoot, ['T1'])
+    const before = fs.readFileSync(path.join(projectDir, 'tasks', 'T1.md'), 'utf8')
+
+    await plugin['tool.execute.before']({ sessionID: 'orch', tool: 'task', callID: 'call-notask' }, { args: { subagent_type: 'fixer', description: 'generic exploration', prompt: 'look around the codebase' } })
+
+    const after = fs.readFileSync(path.join(projectDir, 'tasks', 'T1.md'), 'utf8')
+    assert.equal(after, before, 'unrelated task dispatch must not mutate task frontmatter')
+  })
+})
+
+test('task dispatch with unknown taskID does not crash and does not record', async () => {
+  const repoRoot = makeRepo(); const configRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'yak-config-'))
+  await withEnv({ OPENCODE_CONFIG_DIR: configRoot, XDG_CONFIG_HOME: '' }, async () => {
+    const plugin = await PlanningFilesPlugin({ directory: repoRoot })
+    await plugin.event({ event: { type: 'session.created', properties: { info: { id: 'orch' } } } })
+    seedImplementingProject(repoRoot, ['T1'])
+
+    // T99 doesn't exist on disk. Hook must not throw.
+    await assert.doesNotReject(async () => {
+      await plugin['tool.execute.before']({ sessionID: 'orch', tool: 'task', callID: 'call-ghost' }, { args: { subagent_type: 'fixer', description: 'ghost', prompt: 'taskID: T99\nGhost task' } })
+    })
+  })
+})
+
+test('tool.execute.after hook exists and auto-records reported on task return', async () => {
+  const repoRoot = makeRepo(); const configRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'yak-config-'))
+  await withEnv({ OPENCODE_CONFIG_DIR: configRoot, XDG_CONFIG_HOME: '' }, async () => {
+    const plugin = await PlanningFilesPlugin({ directory: repoRoot })
+    await plugin.event({ event: { type: 'session.created', properties: { info: { id: 'orch' } } } })
+    const { projectDir } = seedImplementingProject(repoRoot, ['T1'])
+    assert.equal(typeof plugin['tool.execute.after'], 'function', 'expected tool.execute.after hook to be defined')
+
+    await plugin['tool.execute.before']({ sessionID: 'orch', tool: 'task', callID: 'call-complete-1' }, { args: { subagent_type: 'fixer', description: 'impl T1', prompt: 'taskID: T1\nExecute the spec' } })
+    // Simulate the subagent finishing and returning.
+    await plugin['tool.execute.after']({ sessionID: 'orch', tool: 'task', callID: 'call-complete-1' }, { args: { subagent_type: 'fixer', prompt: 'taskID: T1\nExecute the spec' }, output: 'done' })
+
+    const { frontmatter } = readMarkdownFrontmatter(path.join(projectDir, 'tasks', 'T1.md'))
+    assert.equal(frontmatter.stage, 'reported', 'expected T1 stage to advance to reported after subagent returns')
+    const progress = fs.readFileSync(path.join(projectDir, 'progress.md'), 'utf8')
+    assert.match(progress, /Task T1 stage dispatched -> reported/)
+  })
+})
+
+test('worker session dispatching task tool does NOT auto-record stage', async () => {
+  const repoRoot = makeRepo(); const configRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'yak-config-'))
+  await withEnv({ OPENCODE_CONFIG_DIR: configRoot, XDG_CONFIG_HOME: '' }, async () => {
+    const plugin = await PlanningFilesPlugin({ directory: repoRoot })
+    await plugin.event({ event: { type: 'session.created', properties: { info: { id: 'orch' } } } })
+    const { projectDir } = seedImplementingProject(repoRoot, ['T1'])
+    await plugin.event({ event: { type: 'session.created', properties: { info: { id: 'worker', parentID: 'orch', taskID: 'T1' } } } })
+    const before = fs.readFileSync(path.join(projectDir, 'tasks', 'T1.md'), 'utf8')
+
+    // Worker firing task tool: even with a taskID, hook must not record (only orchestrators do).
+    await plugin['tool.execute.before']({ sessionID: 'worker', tool: 'task', callID: 'call-worker-1' }, { args: { subagent_type: 'fixer', description: 'nested', prompt: 'taskID: T1\nnested' } }).catch(() => {})
+
+    const after = fs.readFileSync(path.join(projectDir, 'tasks', 'T1.md'), 'utf8')
+    assert.equal(after, before, 'worker dispatch must not mutate task stage')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// yak_task_stage MCP tool (best-effort — skips if @opencode-ai/plugin missing)
+// ---------------------------------------------------------------------------
+
+test('yak_task_stage tool records stage when called as orchestrator', async () => {
+  const repoRoot = makeRepo(); const configRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'yak-config-'))
+  await withEnv({ OPENCODE_CONFIG_DIR: configRoot, XDG_CONFIG_HOME: '' }, async () => {
+    const plugin = await PlanningFilesPlugin({ directory: repoRoot })
+    if (!plugin.tool?.yak_task_stage) return // skip in environments without @opencode-ai/plugin resolvable
+    await plugin.event({ event: { type: 'session.created', properties: { info: { id: 'orch' } } } })
+    const { projectDir } = seedImplementingProject(repoRoot, ['T1'])
+
+    const result = await plugin.tool.yak_task_stage.execute({ task_id: 'T1', stage: 'done', note: 'acceptance passed' }, { sessionID: 'orch' })
+    const { frontmatter } = readMarkdownFrontmatter(path.join(projectDir, 'tasks', 'T1.md'))
+    assert.equal(frontmatter.stage, 'done')
+    assert.ok(result && (typeof result === 'string' || typeof result.output === 'string'))
+  })
+})
+
+test('yak_task_stage tool refuses to record for non-orchestrator roles', async () => {
+  const repoRoot = makeRepo(); const configRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'yak-config-'))
+  await withEnv({ OPENCODE_CONFIG_DIR: configRoot, XDG_CONFIG_HOME: '' }, async () => {
+    const plugin = await PlanningFilesPlugin({ directory: repoRoot })
+    if (!plugin.tool?.yak_task_stage) return
+    await plugin.event({ event: { type: 'session.created', properties: { info: { id: 'orch' } } } })
+    seedImplementingProject(repoRoot, ['T1'])
+    await plugin.event({ event: { type: 'session.created', properties: { info: { id: 'worker', parentID: 'orch', taskID: 'T1' } } } })
+
+    await assert.rejects(
+      async () => plugin.tool.yak_task_stage.execute({ task_id: 'T1', stage: 'done' }, { sessionID: 'worker' }),
+      /orchestrator|role/i,
+    )
+  })
+})
+
+// ---------------------------------------------------------------------------
+// System-prompt injection: role-conditional stage instructions
+// ---------------------------------------------------------------------------
+
+test('strict-phase3 worker system prompt does not instruct workers to record task stage', async () => {
+  const repoRoot = makeRepo(); const configRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'yak-config-'))
+  await withEnv({ OPENCODE_CONFIG_DIR: configRoot, XDG_CONFIG_HOME: '' }, async () => {
+    const plugin = await PlanningFilesPlugin({ directory: repoRoot })
+    await plugin.event({ event: { type: 'session.created', properties: { info: { id: 'orch' } } } })
+    const { projectDir } = seedImplementingProject(repoRoot, ['T1'])
+    fs.writeFileSync(path.join(projectDir, 'project.md'), '---\nstage: implementing\nphase: phase3_execution\nsubphase: dispatch\nactive_tasks: ["T1"]\n---\n')
+    await plugin.event({ event: { type: 'session.created', properties: { info: { id: 'worker', parentID: 'orch', taskID: 'T1' } } } })
+
+    const out = { system: [] }
+    await plugin['experimental.chat.system.transform']({ sessionID: 'worker' }, out)
+    const joined = out.system.join('\n')
+
+    // Worker prompt must be silent on stage recording entirely — no "do this"
+    // and no "do not do this". Mentioning it would just introduce concepts the
+    // worker doesn't need to know about.
+    assert.ok(!/record\s+(every\s+)?task\s+stage/i.test(joined), 'worker prompt must not mention task stage recording at all')
+    assert.ok(!/record-task-stage\.mjs/i.test(joined), 'worker prompt must not reference the node CLI')
+    assert.ok(!/yak_task_stage/i.test(joined), 'worker prompt must not mention the yak_task_stage tool')
+    // Worker binding proper must still be present.
+    assert.match(joined, /only task T1/i)
+  })
+})
+
+test('strict-phase3 orchestrator system prompt references yak_task_stage tool, not node CLI', async () => {
+  const repoRoot = makeRepo(); const configRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'yak-config-'))
+  await withEnv({ OPENCODE_CONFIG_DIR: configRoot, XDG_CONFIG_HOME: '' }, async () => {
+    const plugin = await PlanningFilesPlugin({ directory: repoRoot })
+    await plugin.event({ event: { type: 'session.created', properties: { info: { id: 'orch' } } } })
+    const { projectDir } = seedImplementingProject(repoRoot, ['T1'])
+    fs.writeFileSync(path.join(projectDir, 'project.md'), '---\nstage: implementing\nphase: phase3_execution\nsubphase: dispatch\nactive_tasks: ["T1"]\n---\n')
+
+    const out = { system: [] }
+    await plugin['experimental.chat.system.transform']({ sessionID: 'orch' }, out)
+    const joined = out.system.join('\n')
+
+    assert.match(joined, /yak_task_stage/i, 'orchestrator prompt should mention the tool name')
+    assert.ok(!/node\s+\S*record-task-stage\.mjs/i.test(joined), 'orchestrator prompt must not reference the node CLI')
+    assert.match(joined, /auto-recorded|automatically/i, 'orchestrator prompt should clarify dispatched/reported are auto-recorded')
   })
 })

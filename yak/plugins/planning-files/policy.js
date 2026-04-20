@@ -4,6 +4,7 @@ import { ensureInsideRoot } from './root-resolution.js'
 
 const PLANNING_STAGES = new Set(['planning', 'awaiting_approval'])
 const OPEN_STAGES = new Set(['implementing', 'validating'])
+const EXPLORATION_STAGES = new Set(['exploration'])
 const PLANNING_DENIED_TOOLS = new Set(['rm', 'ast_grep_replace', 'lsp_rename'])
 const KNOWN_MUTATING_TOOLS = new Set([
   'write',
@@ -25,6 +26,10 @@ export function isPlanningStage(stage) {
 
 export function isOpenStage(stage) {
   return OPEN_STAGES.has(stage)
+}
+
+export function isExplorationStage(stage) {
+  return EXPLORATION_STAGES.has(stage)
 }
 
 export function isDeniedPlanningTool(toolName) {

@@ -33,10 +33,12 @@ Arrays replace. Objects deep-merge. Scalars override.
 
 ## Strict workflow backbone
 
-- Yak enforces three top-level phases:
-  - `phase1_discovery`
-  - `phase2_tasks`
-  - `phase3_execution`
+- Yak tracks four phase states in `project.md` frontmatter:
+  - `phase0_exploration` — lightweight default for brand-new projects; no workflow restrictions except hard-protected paths and destructive shell forms.
+  - `phase1_discovery` — strict planning / research / plan shaping
+  - `phase2_tasks` — strict task DAG editing
+  - `phase3_execution` — frozen execution snapshot
+- Users transition Phase 0 → Phase 1 via trigger phrases such as `yak it`, `yak this`, `/yak`, or via the `activateYakForSession` helper. Users can return to Phase 0 via `unyak`, `stop yak`, or `/unyak`.
 - Each phase also tracks a `subphase` in `project.md` frontmatter.
 - Phase movement is strict forward through approval gates, but backward reopening is allowed when new findings invalidate current scope.
 - Phase approvals must come from the question tool, not loose natural-language guesses.

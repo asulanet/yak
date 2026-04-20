@@ -528,6 +528,26 @@ If an approval-sensitive plan change occurs while tasks are in flight:
 - affected tasks return to `draft` or are replaced by new task ids under the new plan revision
 - implementation may not resume until the revised plan is re-approved
 
+### Stage Recording
+
+Stage transitions are written to `tasks/Txxx.md` and `progress.md` by exactly one authority: the orchestrator session. Subagents (`fixer`, `explorer`, `librarian`, `designer`, `oracle`, `council`) MUST NOT record stages — their system prompts explicitly forbid it, and the `yak_task_stage` tool rejects any non-orchestrator caller.
+
+Two transitions are fully automated by the runtime, so the orchestrator never triggers them manually:
+
+- `approved -> dispatched` — auto-recorded in `tool.execute.before` when the orchestrator fires the `task` / `background_task` subagent tool with a parsable `taskID:`.
+- `dispatched -> reported` — auto-recorded in `tool.execute.after` when the subagent tool returns.
+
+All other transitions are recorded by the orchestrator via the `yak_task_stage` tool (`{ task_id, stage, note? }`). These are:
+
+- `draft -> ready` — after task stamping and contract finalization
+- `ready -> approved` — on execution-snapshot gate approval (also triggered automatically by the question-tool gate flow for tasks in the snapshot)
+- `reported -> validating` — when the orchestrator sends the subagent output to a reviewer
+- `validating -> done | rework_required | blocked | rejected` — after review and orchestrator adjudication
+
+The orchestrator MUST NOT shell out to `node yak/scripts/record-task-stage.mjs …` — that CLI exists for humans and external scripts, not for LLM-driven sessions. The `yak_task_stage` tool is the only LLM-facing path; the CLI remains available for CI, manual intervention, and migration scripts.
+
+Dispatch prompts for subagents likewise MUST NOT include instructions telling subagents to record stages. The plugin's system-prompt injection is role-aware: worker sessions receive an explicit "do not record stages" clause in their Yak worker binding; orchestrator sessions receive the `yak_task_stage` tool reference.
+
 ### Detailed Task Spec
 
 Each `tasks/Txxx.md` file must include:

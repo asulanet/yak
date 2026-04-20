@@ -6,12 +6,13 @@ import { fileURLToPath } from 'url'
 import { findNearestGitRoot, ensureInsideRoot } from './planning-files/root-resolution.js'
 import { buildRepoWriteLeaseMetadata, getStaleAfterMs } from './planning-files/locks.js'
 import { appendProgress, bootstrapProjectArtifacts, ensureProjectArtifacts, getDefaultProjectSlug, getExecutionSnapshotPath, getProjectDir, getProjectFilePath, hasCanonicalProjectArtifacts, listProjects, migrateProjectFrontmatter, projectExists, readActiveProjectSlug, readProjectState, readTaskPlan, recordGateApproval, recordTaskModelOutcome, recordTaskStage, recoverProjectState, refreshProjectContext, sanitizeProjectSlug, setProjectPhase, stampTaskContract, summarizeDegradations, updateMarkdownFrontmatter, withProjectDefaults, writeActiveProjectSlug, writeExecutionSnapshot, writeLease, writeReviewsDegradationSection } from './planning-files/session-store.js'
-import { assertApplyPatchAllowedForOrchestrator, assertApplyPatchAllowedForWorker, assertOrchestratorControlMkdirAllowed, assertOrchestratorControlWriteAllowed, assertPlanningWriteAllowed, assertScopedToolAllowed, assertTaskShellAllowed, assertTaskWriteAllowed, extractCandidatePaths, extractScopedToolTargets, hasForbiddenShellSyntax, isBlockedOrchestratorShellCommand, isAllowedReadonlyShell, isAllowedTestRunnerCommand, isDeniedPlanningTool, isMutatingTool, isPlanningStage, isOpenStage } from './planning-files/policy.js'
+import { assertApplyPatchAllowedForOrchestrator, assertApplyPatchAllowedForWorker, assertOrchestratorControlMkdirAllowed, assertOrchestratorControlWriteAllowed, assertPlanningWriteAllowed, assertScopedToolAllowed, assertTaskShellAllowed, assertTaskWriteAllowed, extractCandidatePaths, extractScopedToolTargets, hasForbiddenShellSyntax, isBlockedOrchestratorShellCommand, isAllowedReadonlyShell, isAllowedTestRunnerCommand, isDeniedPlanningTool, isExplorationStage, isMutatingTool, isPlanningStage, isOpenStage, parseApplyPatchPaths } from './planning-files/policy.js'
 import { clearQuestionRequest, recordQuestionResolution, rememberQuestionRequest } from './planning-files/persistence.js'
 import { detectGateApproval, detectGateRequest, extractTextFromParts, looksLikeFreeformQuestion } from './planning-files/question-findings.js'
 import { advanceFallback, describeDegradation, resolveTaskModel } from './planning-files/model-routing.js'
 import { buildPlanCriticPrompt, choosePlanCriticTarget } from './planning-files/review-routing.js'
 import { normalizeAllowedPaths, parseTaskFrontmatter } from './planning-files/task-policy.js'
+import { buildPhaseSystemPrompt, isExplorationPhase, YAK_ACTIVATION_PATTERN, YAK_DEACTIVATION_PATTERN } from './planning-files/prompts.js'
 import { parseJsonc } from '../vendor/jsonc-parser.js'
 
 function readJsonFile(filePath, fallback = {}) { if (!fs.existsSync(filePath)) return fallback; return JSON.parse(fs.readFileSync(filePath, 'utf8')) }
@@ -85,6 +86,21 @@ function isObviousMutatingShellCommand(command = '') {
   return /(^|[;&|])\s*(touch|rm|mv|cp|mkdir|rmdir|chmod|chown|truncate|tee)\b/i.test(command) || />\s*[^\s]/.test(command) || /\b(sudo\s+)?(npm|pnpm|yarn|bun|node|python|pytest|vitest|jest|mocha|tap)\b/.test(command) && /\b(install|add|remove|uninstall|publish|deploy|build|clean)\b/i.test(command)
 }
 
+// The yak_task_stage tool exposes the same enum the session store enforces.
+const YAK_TASK_STAGE_VALUES = ['draft', 'ready', 'approved', 'dispatched', 'reported', 'validating', 'done', 'blocked', 'rework_required', 'rejected']
+
+// Lazily load @opencode-ai/plugin so the yak plugin keeps working in dev/test
+// environments where the package is not resolvable. Real opencode runtimes ship
+// with this package, enabling LLM-facing tool registration.
+async function loadOpencodePluginHelpers() {
+  try {
+    const mod = await import('@opencode-ai/plugin')
+    return { tool: mod.tool || null, z: mod.tool?.schema || null }
+  } catch {
+    return { tool: null, z: null }
+  }
+}
+
 export const PlanningFilesPlugin = async ({ directory }) => {
   const configRoot = getConfigRoot(); const configPath = path.join(configRoot, 'yak.jsonc'); const repoRoot = findNearestGitRoot(directory || process.cwd())
   const globalConfig = readJsoncFile(configPath, {}); const legacyGlobalPath = path.join(configRoot, 'oh-my-opencode-slim.json'); const legacyGlobalConfig = readJsonFile(legacyGlobalPath, {})
@@ -95,6 +111,7 @@ export const PlanningFilesPlugin = async ({ directory }) => {
   const planning = mergeConfig(BUILTIN_WORKFLOW.workflow, readWorkflowShape(legacyGlobalConfig)); Object.assign(planning, mergeConfig(planning, readWorkflowShape(legacyProjectConfig))); Object.assign(planning, mergeConfig(planning, readWorkflowShape(globalConfig))); Object.assign(planning, mergeConfig(planning, readWorkflowShape(projectConfig)))
   const pluginDir = getModuleDir(); const templates = loadTemplates(pluginDir); const runtimeSessions = new Map(); const staleAfterMs = getStaleAfterMs(planning, 5 * 60 * 1000)
   const recordTaskStageScriptPath = path.resolve(pluginDir, '..', 'scripts', 'record-task-stage.mjs')
+  const opencodePluginApi = await loadOpencodePluginHelpers()
   function planningRootFor(rootDir) { return path.join(rootDir, planning.root || '.agents/yak/projects') }
   function projectRoot() { return planningRootFor(repoRoot) }
   function ensureProject(slug) { const projectSlug = sanitizeProjectSlug(slug); const projectDir = ensureProjectArtifacts({ rootDir: repoRoot, projectSlug, templates }).projectDir; writeActiveProjectSlug(repoRoot, projectSlug); writeLease(path.join(projectRoot(), 'repo-write-lease.json'), buildRepoWriteLeaseMetadata({ sessionID: projectSlug, ownerID: `orchestrator-${process.pid}`, leaseID: `lease-${projectSlug}`, repoRoot, staleAfterMs })); return { projectSlug, projectDir } }
@@ -112,6 +129,10 @@ export const PlanningFilesPlugin = async ({ directory }) => {
       pending_child_task_ids: existing?.pending_child_task_ids || [],
       pending_questions: existing?.pending_questions || new Map(),
       processed_freeform_questions: existing?.processed_freeform_questions || new Set(),
+      processed_yak_triggers: existing?.processed_yak_triggers || new Set(),
+      // callID -> taskID for auto-recording `dispatched` -> `reported` around
+      // the `task` / `background_task` subagent tool lifecycle.
+      pending_task_dispatches: existing?.pending_task_dispatches || new Map(),
     })
     return runtimeSessions.get(opencodeSessionID)
   }
@@ -283,7 +304,49 @@ export const PlanningFilesPlugin = async ({ directory }) => {
     try { appendProgress(getProjectFilePath(runtimeSession.project_dir, 'progress.md'), [line]) } catch {}
     return { skipped: true, reason: reason || null }
   }
-  return { offerPlanCriticForSession, recordPlanCriticResultForSession, skipPlanCriticForSession, recordTaskStageForSession, refreshDegradationSummaryForSession, event: async ({ event }) => {
+  function activateYakForSession(sessionID, { reason } = {}) {
+    const runtimeSession = runtimeSessions.get(sessionID) || bootstrapRuntimeSession(sessionID)
+    if (!runtimeSession) return null
+    const projectFilePath = getProjectFilePath(runtimeSession.project_dir, 'project.md')
+    const { frontmatter } = readProjectState(projectFilePath)
+    if (!isExplorationPhase({ phase: frontmatter.phase, stage: frontmatter.stage })) return { activated: false, phase: frontmatter.phase, stage: frontmatter.stage, reason: 'already_active' }
+    setProjectPhase(projectFilePath, { phase: 'phase1_discovery', subphase: 'scope_draft', stage: 'planning' })
+    try { appendProgress(getProjectFilePath(runtimeSession.project_dir, 'progress.md'), [`- ${new Date().toISOString()} Yak activated programmatically${reason ? `: ${reason}` : ''}`]) } catch {}
+    return { activated: true, phase: 'phase1_discovery', subphase: 'scope_draft', stage: 'planning' }
+  }
+  function deactivateYakForSession(sessionID, { reason } = {}) {
+    const runtimeSession = runtimeSessions.get(sessionID) || bootstrapRuntimeSession(sessionID)
+    if (!runtimeSession) return null
+    const projectFilePath = getProjectFilePath(runtimeSession.project_dir, 'project.md')
+    const { frontmatter } = readProjectState(projectFilePath)
+    if (isExplorationPhase({ phase: frontmatter.phase, stage: frontmatter.stage })) return { deactivated: false, phase: frontmatter.phase, stage: frontmatter.stage, reason: 'already_exploration' }
+    setProjectPhase(projectFilePath, { phase: 'phase0_exploration', subphase: 'idle', stage: 'exploration' })
+    try { appendProgress(getProjectFilePath(runtimeSession.project_dir, 'progress.md'), [`- ${new Date().toISOString()} Yak deactivated programmatically${reason ? `: ${reason}` : ''}`]) } catch {}
+    return { deactivated: true, phase: 'phase0_exploration', subphase: 'idle', stage: 'exploration' }
+  }
+
+  // LLM-facing tool for orchestrator-only task stage transitions. Skipped when
+  // @opencode-ai/plugin is not resolvable (dev/test envs). The orchestrator's
+  // system prompt reminds it to use this instead of the record-task-stage CLI.
+  const yakTaskStageTool = opencodePluginApi.tool && opencodePluginApi.z
+    ? opencodePluginApi.tool({
+        description: 'Record a Yak task stage transition. ORCHESTRATOR ONLY — subagents (@fixer, @explorer, etc.) must never call this tool. Note: `dispatched` and `reported` are auto-recorded by the runtime when the `task` tool is fired, so call this tool only for `approved`, `validating`, `done`, `blocked`, `rework_required`, `rejected`, and rare `draft`/`ready` corrections.',
+        args: {
+          task_id: opencodePluginApi.z.string().describe('Task ID, e.g. "T001".'),
+          stage: opencodePluginApi.z.enum(YAK_TASK_STAGE_VALUES).describe('Target stage.'),
+          note: opencodePluginApi.z.string().optional().describe('Optional note appended to progress.md.'),
+        },
+        async execute(args, context) {
+          const rs = runtimeSessions.get(context?.sessionID) || (context?.sessionID ? bootstrapRuntimeSession(context.sessionID) : null)
+          if (!rs) throw new Error('yak_task_stage: no active Yak project for this session')
+          if (rs.role !== 'orchestrator') throw new Error('yak_task_stage: orchestrator role required — subagents must never record task stages directly')
+          const result = recordTaskStage({ projectDir: rs.project_dir, taskId: args.task_id, stage: args.stage, note: args.note })
+          return { output: `Task ${args.task_id} stage -> ${args.stage}${result.previousStage ? ` (was ${result.previousStage})` : ''}`, metadata: { task_id: args.task_id, stage: args.stage, previous: result.previousStage || null } }
+        },
+      })
+    : null
+
+  return { ...(yakTaskStageTool ? { tool: { yak_task_stage: yakTaskStageTool } } : {}), offerPlanCriticForSession, recordPlanCriticResultForSession, skipPlanCriticForSession, recordTaskStageForSession, refreshDegradationSummaryForSession, activateYakForSession, deactivateYakForSession, event: async ({ event }) => {
     if (!planning.enabled || !repoRoot) return; const opencodeSessionID = event.properties?.sessionID || event.properties?.info?.id || event.properties?.id
     if (event.type === 'session.created') { if (!opencodeSessionID) return; const parentID = event.properties?.info?.parentID; if (parentID && inheritRuntimeSession(opencodeSessionID, parentID, event.properties?.info || {})) return; bootstrapRuntimeSession(opencodeSessionID); return }
     if (event.type === 'session.deleted') { if (!opencodeSessionID) return; runtimeSessions.delete(opencodeSessionID); return }
@@ -347,7 +410,48 @@ export const PlanningFilesPlugin = async ({ directory }) => {
     const projectFilePath = getProjectFilePath(runtimeSession.project_dir, 'project.md')
     const { frontmatter } = readProjectState(projectFilePath)
     const stage = frontmatter.stage || 'planning'
-    if (runtimeSession.role === 'orchestrator' && (input.tool === 'task' || input.tool === 'background_task')) rememberPendingTaskBinding(runtimeSession, args)
+    if (runtimeSession.role === 'orchestrator' && (input.tool === 'task' || input.tool === 'background_task')) {
+      rememberPendingTaskBinding(runtimeSession, args)
+      // Auto-record the `dispatched` stage. This is the runtime-driven half of
+      // the fix that prevents subagent prompts from asking fixers/explorers to
+      // run the record-task-stage CLI themselves — only the orchestrator
+      // dispatches, so only the orchestrator sees this hook.
+      const dispatchedTaskID = extractTaskBindingFromArgs(args)
+      if (dispatchedTaskID && input.callID && !isExplorationStage(stage)) {
+        runtimeSession.pending_task_dispatches.set(input.callID, dispatchedTaskID)
+        try {
+          recordTaskStage({ projectDir: runtimeSession.project_dir, taskId: dispatchedTaskID, stage: 'dispatched', note: 'auto-recorded on task tool dispatch' })
+        } catch {
+          // Silent: the target task file may not exist yet (e.g. ad-hoc dispatch
+          // before the task was stamped). Don't block dispatch for bookkeeping.
+        }
+      }
+    }
+    // Phase 0 / exploration: lightweight mode. Only block hard-protected paths and destructive shell forms.
+    if (isExplorationStage(stage)) {
+      if (input.tool === 'bash' || input.tool === 'shell') {
+        const command = args.command || ''
+        if (isBlockedOrchestratorShellCommand(command)) throw new Error('Yak exploration denies destructive shell form')
+        return
+      }
+      if (['write', 'edit', 'lsp_rename', 'ast_grep_replace', 'rm', 'mkdir'].includes(input.tool)) {
+        for (const candidatePath of extractCandidatePaths(args)) {
+          assertOrchestratorControlWriteAllowed({ repoRoot, projectDir: runtimeSession.project_dir, filePath: candidatePath, toolName: input.tool })
+        }
+        return
+      }
+      if (input.tool === 'apply_patch') {
+        const patchText = args.patchText || args.patch || args.content || args.text || ''
+        const paths = parseApplyPatchPaths(patchText)
+        if (paths.length === 0) throw new Error('apply_patch parse failed: no touched paths found')
+        for (const filePath of paths) {
+          if (filePath.includes('..')) throw new Error(`apply_patch escapes repo root: ${filePath}`)
+          assertOrchestratorControlWriteAllowed({ repoRoot, projectDir: runtimeSession.project_dir, filePath: path.resolve(repoRoot, filePath), toolName: 'apply_patch' })
+        }
+        return
+      }
+      return
+    }
     if (isPlanningStage(stage) && ['write', 'edit'].includes(input.tool)) {
       for (const candidatePath of extractCandidatePaths(args)) {
         if (path.basename(candidatePath) === 'project.md' || path.resolve(candidatePath) === path.resolve(projectFilePath)) {
@@ -413,13 +517,66 @@ export const PlanningFilesPlugin = async ({ directory }) => {
       return
     }
     const taskPolicy = loadActiveTaskPolicy(runtimeSession.project_dir, frontmatter, runtimeSession); if (input.tool === 'bash' || input.tool === 'shell') { const command = args.command || ''; assertTaskShellAllowed(command, taskPolicy.allowedShellCommands); return } if (['write', 'edit'].includes(input.tool)) { if (runtimeSession.role !== 'worker') { for (const candidatePath of extractCandidatePaths(args)) assertOrchestratorControlWriteAllowed({ repoRoot, projectDir: runtimeSession.project_dir, filePath: candidatePath, toolName: input.tool }); return } for (const candidatePath of extractCandidatePaths(args)) assertTaskWriteAllowed({ repoRoot, allowedPaths: taskPolicy.writeRoots, forbiddenPaths: taskPolicy.protectedPaths, filePath: candidatePath }); return } if (input.tool === 'mkdir') { if (runtimeSession.role !== 'worker') { for (const candidatePath of extractCandidatePaths(args)) assertOrchestratorControlMkdirAllowed({ repoRoot, projectDir: runtimeSession.project_dir, dirPath: candidatePath }); return } for (const candidatePath of extractCandidatePaths(args)) assertTaskWriteAllowed({ repoRoot, allowedPaths: taskPolicy.writeRoots, forbiddenPaths: taskPolicy.protectedPaths, filePath: candidatePath }); return } if (input.tool === 'apply_patch') { const patchText = args.patchText || args.patch || args.content || args.text || ''; if (runtimeSession.role !== 'worker') { assertApplyPatchAllowedForOrchestrator({ repoRoot, projectDir: runtimeSession.project_dir, patchText }); return } assertApplyPatchAllowedForWorker({ repoRoot, allowedPaths: taskPolicy.writeRoots, forbiddenPaths: taskPolicy.protectedPaths, patchText }); return } if (input.tool === 'rm') { if (runtimeSession.role !== 'worker') throw new Error('Implementation mode denies rm for orchestrator sessions'); for (const candidatePath of extractCandidatePaths(args)) assertTaskWriteAllowed({ repoRoot, allowedPaths: taskPolicy.writeRoots, forbiddenPaths: taskPolicy.protectedPaths, filePath: candidatePath }); return } if (input.tool === 'lsp_rename') { if (runtimeSession.role !== 'worker') throw new Error('Implementation mode denies lsp_rename for orchestrator sessions outside Yak control files'); const filePath = args.filePath || args.path; if (!filePath) throw new Error('lsp_rename requires explicit filePath'); assertTaskWriteAllowed({ repoRoot, allowedPaths: taskPolicy.writeRoots, forbiddenPaths: taskPolicy.protectedPaths, filePath: path.resolve(repoRoot, filePath) }); return } if (input.tool === 'ast_grep_replace') { if (runtimeSession.role !== 'worker') throw new Error('Implementation mode denies ast_grep_replace for orchestrator sessions outside Yak control files'); assertScopedToolAllowed({ repoRoot, allowedPaths: taskPolicy.writeRoots, forbiddenPaths: taskPolicy.protectedPaths, targets: extractScopedToolTargets(args), toolName: 'ast_grep_replace' }); return }
+  }, 'tool.execute.after': async (input, _output) => {
+    // Runtime-driven counterpart of tool.execute.before's dispatched recording.
+    // When the subagent task tool call returns (successfully or with error),
+    // flip the bound task to `reported` so the orchestrator can then decide
+    // whether to mark it `validating`, `done`, `blocked`, etc. via the
+    // yak_task_stage tool (no CLI needed).
+    if (!planning.enabled || !repoRoot) return
+    const runtimeSession = runtimeSessions.get(input.sessionID)
+    if (!runtimeSession) return
+    if (runtimeSession.role !== 'orchestrator') return
+    if (input.tool !== 'task' && input.tool !== 'background_task') return
+    if (!input.callID) return
+    const dispatchedTaskID = runtimeSession.pending_task_dispatches.get(input.callID)
+    if (!dispatchedTaskID) return
+    runtimeSession.pending_task_dispatches.delete(input.callID)
+    try {
+      recordTaskStage({ projectDir: runtimeSession.project_dir, taskId: dispatchedTaskID, stage: 'reported', note: 'auto-recorded on task tool return' })
+    } catch {
+      // Same rationale as tool.execute.before: never fail user-facing dispatch
+      // flow for bookkeeping errors (e.g. task file was moved/deleted).
+    }
   }, 'experimental.chat.messages.transform': async (_input, output) => {
     if (!planning.enabled || !repoRoot) return
     const messages = Array.isArray(output.messages) ? output.messages : []
+    if (messages.length === 0) return
+
+    // Find the latest user message. Needed for both yak triggers and freeform
+    // question capture, so compute once.
+    const latestUserMeta = [...messages].map((entry, index) => ({ entry, index })).reverse().find(({ entry }) => entry?.info?.role === 'user')
+    const latestUserIndex = latestUserMeta?.index
+    const latestUser = latestUserMeta?.entry
+
+    // Yak activation / deactivation triggers run on any user message, including
+    // the very first one in a session.
+    if (latestUser) {
+      const triggerSessionID = latestUser?.info?.sessionID
+      const triggerSession = triggerSessionID ? (runtimeSessions.get(triggerSessionID) || bootstrapRuntimeSession(triggerSessionID)) : null
+      if (triggerSession && triggerSession.role === 'orchestrator') {
+        const userText = extractTextFromParts(latestUser.parts) || ''
+        const triggerFingerprint = `trigger:${latestUser?.info?.id || ''}:${userText.slice(0, 64)}`
+        if (!triggerSession.processed_yak_triggers.has(triggerFingerprint)) {
+          const triggerProjectPath = getProjectFilePath(triggerSession.project_dir, 'project.md')
+          const { frontmatter: triggerFrontmatter } = readProjectState(triggerProjectPath)
+          const currentlyExploration = isExplorationPhase({ phase: triggerFrontmatter.phase, stage: triggerFrontmatter.stage })
+          if (YAK_ACTIVATION_PATTERN.test(userText) && currentlyExploration) {
+            setProjectPhase(triggerProjectPath, { phase: 'phase1_discovery', subphase: 'scope_draft', stage: 'planning' })
+            try { appendProgress(getProjectFilePath(triggerSession.project_dir, 'progress.md'), [`- ${new Date().toISOString()} Yak activated by user trigger; entering phase1_discovery`]) } catch {}
+            triggerSession.processed_yak_triggers.add(triggerFingerprint)
+          } else if (YAK_DEACTIVATION_PATTERN.test(userText) && !currentlyExploration) {
+            setProjectPhase(triggerProjectPath, { phase: 'phase0_exploration', subphase: 'idle', stage: 'exploration' })
+            try { appendProgress(getProjectFilePath(triggerSession.project_dir, 'progress.md'), [`- ${new Date().toISOString()} Yak deactivated by user trigger; returning to phase0_exploration`]) } catch {}
+            triggerSession.processed_yak_triggers.add(triggerFingerprint)
+          }
+        }
+      }
+    }
+
+    // Freeform question capture requires at least one prior assistant message.
     if (messages.length < 2) return
-    const latestUserIndex = [...messages].map((entry, index) => ({ entry, index })).reverse().find(({ entry }) => entry?.info?.role === 'user')?.index
     if (latestUserIndex == null || latestUserIndex <= 0) return
-    const latestUser = messages[latestUserIndex]
     const runtimeSession = runtimeSessions.get(latestUser?.info?.sessionID) || bootstrapRuntimeSession(latestUser?.info?.sessionID)
     if (!runtimeSession || runtimeSession.role !== 'orchestrator') return
     const previousAssistant = [...messages.slice(0, latestUserIndex)].reverse().find((entry) => entry?.info?.role === 'assistant' && entry?.info?.sessionID === latestUser?.info?.sessionID)
@@ -433,18 +590,58 @@ export const PlanningFilesPlugin = async ({ directory }) => {
     runtimeSession.processed_freeform_questions.add(fingerprint)
   }, 'experimental.chat.system.transform': async (input, output) => {
     if (!planning.enabled || !repoRoot || !input.sessionID) return
-    const runtimeSession = runtimeSessions.get(input.sessionID)
+    // Fix: bootstrap the runtime session if it has not been created yet.
+    // The session.created event and system.transform can race; tool.execute.before
+    // already bootstraps lazily, and we must do the same here so Yak state is
+    // injected on turn 1 instead of only after the first tool call.
+    const runtimeSession = runtimeSessions.get(input.sessionID) || bootstrapRuntimeSession(input.sessionID)
     if (!runtimeSession) return
+    if (!Array.isArray(output.system)) output.system = []
     const { frontmatter } = readProjectState(getProjectFilePath(runtimeSession.project_dir, 'project.md'))
+    const exploration = isExplorationPhase({ phase: frontmatter.phase, stage: frontmatter.stage })
+
+    // Build phase-aware directive block and place it at the TOP of the system
+    // message list via unshift so it outranks default skills/agent descriptions.
+    const phasePrompt = buildPhaseSystemPrompt({
+      phase: frontmatter.phase,
+      subphase: frontmatter.subphase,
+      stage: frontmatter.stage,
+      slug: runtimeSession.active_project_slug,
+      projectDir: path.relative(repoRoot, runtimeSession.project_dir),
+      activeTasks: frontmatter.active_tasks,
+      openQuestions: frontmatter.open_questions,
+      recordScriptPath: recordTaskStageScriptPath,
+    })
+    output.system.unshift(phasePrompt)
+
+    // The remaining reminders are only relevant once Yak is in strict mode.
+    // Phase 0 should feel like a normal OpenCode session, so we skip them.
+    if (exploration) {
+      if (runtimeSession.pending_questions?.size) {
+        output.system.push('Yak reminder: unresolved user question pending. Persist reusable answer into findings/context/progress before making status or next-step claims.')
+      }
+      return
+    }
+
     const chapterMap = ['scope', 'constraints', 'findings', 'decisions', 'task-dag', 'execution', 'reviews']
     output.system.push(`Yak navigator: end meaningful replies with compact phase summary. Current: ${frontmatter.phase}/${frontmatter.subphase}. Active tasks: ${(frontmatter.active_tasks || []).join(', ') || 'none'}. Open questions: ${(frontmatter.open_questions || []).join(', ') || 'none'}. Other plan chapters: ${chapterMap.join(', ')}.`)
     if (fs.existsSync(path.join(repoRoot, 'AGENTS.md'))) {
       output.system.push('Yak rule: read and follow repo-local AGENTS.md. Lower-level subagents inherit those restrictions unless task explicitly widens scope.')
     }
     if (runtimeSession.role === 'worker' && runtimeSession.bound_task_id) {
+      // Keep the worker binding narrow. Stage recording is the orchestrator's
+      // concern; mentioning it here (even as a prohibition) just introduces
+      // concepts the worker doesn't need. The yak_task_stage tool is also not
+      // exposed to workers (execute() throws on non-orchestrator role), so
+      // there is no footgun to warn against.
       output.system.push(`Yak worker binding: you are executing only task ${runtimeSession.bound_task_id}. Stay within approved task intent. If plan drift appears, stop and escalate.`)
     }
-    output.system.push(`Yak task state: record every task stage transition with \`node ${recordTaskStageScriptPath} --task <T###> --stage <draft|ready|approved|dispatched|reported|validating|done|blocked|rework_required|rejected> [--note "<text>"]\`. Never mutate planning artifacts via shell rewrites, python, heredocs, or ad-hoc scripts.`)
+    if (runtimeSession.role === 'orchestrator') {
+      // opencode runtime always ships @opencode-ai/plugin, so yak_task_stage is
+      // reliably registered in production. We reference it unconditionally to
+      // avoid drifting between tool registration and prompt text.
+      output.system.push('Yak task state: the `dispatched` and `reported` stages are auto-recorded for you whenever you fire the `task` / `background_task` subagent tool. For any other stage transition (`approved`, `validating`, `done`, `blocked`, `rework_required`, `rejected`, and rare `draft`/`ready` corrections) call the `yak_task_stage` tool with `{ task_id, stage, note? }`. Never shell out to `node` or the record-task-stage.mjs CLI to record stages. Never mutate planning artifacts via shell rewrites, python heredocs, or ad-hoc scripts.')
+    }
     const targetTaskID = runtimeSession.bound_task_id || (Array.isArray(frontmatter.active_tasks) ? frontmatter.active_tasks[0] : null)
     if (targetTaskID) {
       const taskFrontmatter = readTaskFrontmatterSafely(runtimeSession.project_dir, targetTaskID)

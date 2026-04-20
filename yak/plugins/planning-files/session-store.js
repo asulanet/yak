@@ -11,9 +11,9 @@ export const ACTIVE_PROJECT_POINTER_FILE = path.join('.agents', 'yak', 'active-p
 export const DEFAULT_PROJECT_FRONTMATTER = {
   project_slug: null,
   project_dir: null,
-  stage: 'planning',
-  phase: 'phase1_discovery',
-  subphase: 'discovery',
+  stage: 'exploration',
+  phase: 'phase0_exploration',
+  subphase: 'idle',
   phase1_revision: 1,
   phase1_approved_revision: null,
   phase2_revision: 0,
@@ -39,15 +39,40 @@ function normalizeArray(value) {
   return Array.isArray(value) ? value : []
 }
 
+// When a legacy / partial project.md declares a stage but no phase, infer a
+// sensible phase from the stage so migrations from pre-Phase-0 projects keep
+// working. Only kicks in when the phase field is missing from the input.
+function derivePhaseFromStage(stage) {
+  if (!stage) return null
+  if (stage === 'exploration') return 'phase0_exploration'
+  if (stage === 'implementing' || stage === 'validating' || stage === 'completed') return 'phase3_execution'
+  // 'planning', 'awaiting_approval', 'quarantined', or any other legacy value
+  return 'phase1_discovery'
+}
+
+function deriveSubphaseFromPhase(phase) {
+  if (!phase) return null
+  if (phase === 'phase0_exploration') return 'idle'
+  if (phase === 'phase1_discovery') return 'discovery'
+  if (phase === 'phase2_tasks') return 'task_graph_draft'
+  if (phase === 'phase3_execution') return 'dispatch'
+  return null
+}
+
 export function withProjectDefaults(frontmatter = {}) {
+  const input = frontmatter || {}
+  const derivedPhase = input.phase || derivePhaseFromStage(input.stage) || DEFAULT_PROJECT_FRONTMATTER.phase
+  const derivedSubphase = input.subphase || deriveSubphaseFromPhase(derivedPhase) || DEFAULT_PROJECT_FRONTMATTER.subphase
   return {
     ...DEFAULT_PROJECT_FRONTMATTER,
-    ...frontmatter,
-    approved_task_ids: normalizeArray(frontmatter.approved_task_ids),
-    draft_task_ids: normalizeArray(frontmatter.draft_task_ids),
-    blocked_task_ids: normalizeArray(frontmatter.blocked_task_ids),
-    active_tasks: normalizeArray(frontmatter.active_tasks),
-    open_questions: normalizeArray(frontmatter.open_questions),
+    ...input,
+    phase: derivedPhase,
+    subphase: derivedSubphase,
+    approved_task_ids: normalizeArray(input.approved_task_ids),
+    draft_task_ids: normalizeArray(input.draft_task_ids),
+    blocked_task_ids: normalizeArray(input.blocked_task_ids),
+    active_tasks: normalizeArray(input.active_tasks),
+    open_questions: normalizeArray(input.open_questions),
   }
 }
 

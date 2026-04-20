@@ -101,7 +101,13 @@ test('project defaults, phase helpers, and execution snapshots are persisted', (
 
   writeMarkdownFrontmatter(projectFile, { project_slug: 'alpha' }, 'project body')
   const loaded = readMarkdownFrontmatter(projectFile)
-  assert.equal(withProjectDefaults(loaded.frontmatter).phase, 'phase1_discovery')
+  // A truly empty project.md (no stage, no phase) now defaults to Phase 0
+  // exploration. Legacy projects with an explicit stage still derive the
+  // classic phase via withProjectDefaults.
+  assert.equal(withProjectDefaults(loaded.frontmatter).phase, 'phase0_exploration')
+  assert.equal(withProjectDefaults(loaded.frontmatter).stage, 'exploration')
+  assert.equal(withProjectDefaults({ stage: 'planning' }).phase, 'phase1_discovery')
+  assert.equal(withProjectDefaults({ stage: 'implementing' }).phase, 'phase3_execution')
 
   setProjectPhase(projectFile, { phase: 'phase2_tasks', subphase: 'task_graph_draft', stage: 'planning' })
   let current = readMarkdownFrontmatter(projectFile).frontmatter
