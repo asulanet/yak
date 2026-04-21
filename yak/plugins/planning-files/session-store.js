@@ -1,13 +1,46 @@
 import fs from 'fs'
 import path from 'path'
 import { fileURLToPath } from 'url'
-import { writeJsonAtomic } from './locks.js'
+import { acquireJsonLock, isStale, readJson, releaseJsonLock, writeJsonAtomic } from './locks.js'
 import { parseTaskFrontmatter } from './task-policy.js'
 
 const moduleDir = path.dirname(fileURLToPath(import.meta.url))
 
 export const PROJECTS_DIR = path.join('.agents', 'yak', 'projects')
 export const ACTIVE_PROJECT_POINTER_FILE = path.join('.agents', 'yak', 'active-project.json')
+
+// Canonical task-ID validator.
+//
+// Accepts two shapes:
+//   - legacy bare:    T<digits>          (convention: three digits, e.g. T001)
+//   - batch-prefixed: B<digits>-T<digits> (convention: B<N>-T###, e.g. B2-T001)
+//
+// The batch prefix is introduced alongside the multi-batch workflow feature.
+// Legacy (bare) IDs stay valid forever so Batch 1 tasks do not need a
+// retroactive rename when the feature ships. The `T###` (three-digit) form
+// is the convention for generators and tooling; the regex accepts one-or-more
+// digits so test fixtures and edge cases keep working without inventing a
+// parallel validator.
+//
+// All modules that parse, validate, write, or read task IDs MUST consume
+// these exports rather than defining their own regex. See:
+//   - task-policy.js parseTaskFrontmatter
+//   - scripts/record-task-stage.mjs --task arg parser
+//   - future carry/clone logic in startNewBatch
+export const TASK_ID_PATTERN = /^(?:B\d+-)?T\d+$/
+export function isValidTaskId(id) { return typeof id === 'string' && TASK_ID_PATTERN.test(id) }
+
+// Batch-metadata fields.
+//
+// These are lazy-persisted: `withProjectDefaults` surfaces them in memory for
+// every project (so runtime code can read current_batch without branching),
+// but `migrateProjectFrontmatter` deliberately does NOT write them to disk
+// for legacy projects that lack the fields. They first land on disk when the
+// multi-batch lifecycle engine (T009's startNewBatch) commits a real
+// transition. This guarantees byte-identical round-trips for legacy projects
+// that upgrade past this schema change without ever running new-batch.
+export const BATCH_FRONTMATTER_FIELDS = Object.freeze(['current_batch', 'batches_completed', 'batch_started_at'])
+
 export const DEFAULT_PROJECT_FRONTMATTER = {
   project_slug: null,
   project_dir: null,
@@ -33,6 +66,9 @@ export const DEFAULT_PROJECT_FRONTMATTER = {
   execution_authorized: false,
   last_gate_question_id: null,
   change_impact_level: 'local',
+  current_batch: 1,
+  batches_completed: [],
+  batch_started_at: null,
 }
 
 function normalizeArray(value) {
@@ -73,8 +109,15 @@ export function withProjectDefaults(frontmatter = {}) {
     blocked_task_ids: normalizeArray(input.blocked_task_ids),
     active_tasks: normalizeArray(input.active_tasks),
     open_questions: normalizeArray(input.open_questions),
+    batches_completed: normalizeArray(input.batches_completed),
   }
 }
+
+// Fields that are runtime-defaulted but not persisted-on-migrate unless the
+// input already had them. Keeps legacy projects byte-identical on disk when
+// they first encounter the batch-aware schema, per the lazy-persistence
+// contract documented on BATCH_FRONTMATTER_FIELDS.
+const LAZY_PERSIST_FIELDS = new Set(BATCH_FRONTMATTER_FIELDS)
 
 export function migrateProjectFrontmatter({ projectDir } = {}) {
   if (!projectDir) return { migrated: false, addedKeys: [], preservedKeys: [] }
@@ -85,15 +128,19 @@ export function migrateProjectFrontmatter({ projectDir } = {}) {
   const current = frontmatter || {}
   const next = withProjectDefaults(current)
   const schemaKeys = new Set(Object.keys(DEFAULT_PROJECT_FRONTMATTER))
-  const addedKeys = Object.keys(DEFAULT_PROJECT_FRONTMATTER).filter((key) => !(key in current))
+  const persistedKeys = Object.keys(DEFAULT_PROJECT_FRONTMATTER).filter((key) => !LAZY_PERSIST_FIELDS.has(key) || (key in current))
+  const addedKeys = persistedKeys.filter((key) => !(key in current))
   const preservedKeys = Object.keys(current).filter((key) => !schemaKeys.has(key))
+  const persistent = {}
+  for (const key of persistedKeys) persistent[key] = next[key]
+  for (const key of preservedKeys) persistent[key] = current[key]
   const currentBytes = fs.readFileSync(projectPath, 'utf8')
-  const nextYaml = Object.entries(next).map(([key, value]) => `${key}: ${JSON.stringify(value)}`).join('\n')
+  const nextYaml = Object.entries(persistent).map(([key, value]) => `${key}: ${JSON.stringify(value)}`).join('\n')
   const nextBytes = `---\n${nextYaml}\n---\n${body}`
 
   if (currentBytes === nextBytes) return { migrated: false, addedKeys: [], preservedKeys }
 
-  writeMarkdownFrontmatter(projectPath, next, body)
+  writeMarkdownFrontmatter(projectPath, persistent, body)
   return { migrated: true, addedKeys, preservedKeys }
 }
 
@@ -500,4 +547,515 @@ export function recoverProjectState({ repoRoot, projectDir }) {
   writeMarkdownFrontmatter(projectPath, nextFrontmatter, body)
   writeActiveProjectSlug(repoRoot, path.basename(projectDir))
   return { changed: true, projectPath }
+}
+
+// ============================================================================
+// Multi-batch workflow lifecycle (T009)
+//
+// A "batch" is one full Phase 1→3 cycle inside a Yak project. Multiple batches
+// can live in the same workspace; shared memory (findings, context, progress,
+// backlog 'later') carries across them while batch-scoped artifacts (tasks/,
+// tasks.md, execution-snapshot.md, reviews, backlog done/dropped) archive into
+// `<project>/batches/<N>/` when a new batch opens.
+//
+// The transition uses a journaled-commit pattern with three phases:
+//
+//   prepared   → lock held, staging copy complete, journal written; no user-
+//                visible mutations yet. Crash here: rollback from staging.
+//   committing → moves + frontmatter writes in progress; dst paths populated
+//                incrementally. Crash here: rollback (staging is authoritative
+//                pre-transition state, rollback is idempotent).
+//   committed  → all writes complete and durable. Crash during cleanup:
+//                finalize (delete staging + journal + lock).
+//
+// Cleanup order on success is STRICT: staging → journal → lock. That ordering
+// is what makes the "no-journal-but-lock" crash window deterministically
+// recoverable: if we see a lock without a journal, writes are already durable
+// and we only need to release the lock.
+//
+// Stale-lock recovery: if the lock exists but its heartbeat is older than
+// STALE_TRANSITION_LOCK_MS and no journal is present, recovery reclaims the
+// lock and continues.
+// ============================================================================
+
+const TRANSITION_LOCK_BASENAME = '.batch-transition.lock'
+const TRANSITION_JOURNAL_BASENAME = '.batch-transition-journal.json'
+const TRANSITION_STAGING_BASENAME = '.batch-transition-staging'
+export const STALE_TRANSITION_LOCK_MS = 60 * 1000
+
+export class IncompleteTasksError extends Error {
+  constructor(tasks) {
+    const ids = tasks.map((task) => task.task_id || '?').join(', ')
+    super(`Incomplete tasks at batch boundary: ${ids}`)
+    this.name = 'IncompleteTasksError'
+    this.incompleteTasks = tasks
+  }
+}
+
+export class BatchCancelledError extends Error {
+  constructor() {
+    super('Batch transition cancelled by policy')
+    this.name = 'BatchCancelledError'
+  }
+}
+
+class BatchTransitionInProgressError extends Error {
+  constructor(status) {
+    super(`batch transition in progress${status ? ` (status=${status})` : ''}; call recovery first`)
+    this.name = 'BatchTransitionInProgressError'
+    this.journalStatus = status || null
+  }
+}
+
+function transitionPaths(projectDir) {
+  return {
+    projectPath: path.join(projectDir, 'project.md'),
+    tasksDir: path.join(projectDir, 'tasks'),
+    tasksFile: path.join(projectDir, 'tasks.md'),
+    snapshotFile: path.join(projectDir, 'execution-snapshot.md'),
+    reviewsFile: path.join(projectDir, 'reviews.md'),
+    reviewsDir: path.join(projectDir, 'reviews'),
+    backlogFile: path.join(projectDir, 'backlog.md'),
+    progressFile: path.join(projectDir, 'progress.md'),
+    summaryFile: path.join(projectDir, 'batch-summary.md'),
+    summaryTemplate: path.join(moduleDir, 'templates', 'batch-summary.md'),
+    lockFile: path.join(projectDir, TRANSITION_LOCK_BASENAME),
+    journalFile: path.join(projectDir, TRANSITION_JOURNAL_BASENAME),
+    stagingDir: path.join(projectDir, TRANSITION_STAGING_BASENAME),
+  }
+}
+
+function batchDir(projectDir, batch) {
+  return path.join(projectDir, 'batches', String(batch))
+}
+
+function listIncompleteTasks(tasksDir) {
+  if (!fs.existsSync(tasksDir)) return []
+  const out = []
+  for (const entry of fs.readdirSync(tasksDir, { withFileTypes: true })) {
+    if (!entry.isFile() || !entry.name.endsWith('.md')) continue
+    const taskPath = path.join(tasksDir, entry.name)
+    const { frontmatter } = readMarkdownFrontmatter(taskPath)
+    const stage = frontmatter.stage || null
+    if (stage && stage !== 'done' && stage !== 'rejected') {
+      out.push({ task_id: frontmatter.task_id || entry.name.replace(/\.md$/, ''), stage, path: taskPath })
+    }
+  }
+  return out
+}
+
+function computePlannedMoves(paths, closingBatch) {
+  const moves = []
+  const target = batchDir('', closingBatch) // relative
+  if (fs.existsSync(paths.tasksDir)) {
+    for (const entry of fs.readdirSync(paths.tasksDir, { withFileTypes: true })) {
+      if (entry.isFile() && entry.name.endsWith('.md')) {
+        moves.push({
+          src: path.join('tasks', entry.name),
+          dst: path.join(target, 'tasks', entry.name),
+          kind: 'file',
+        })
+      }
+    }
+  }
+  for (const [baseName, relName] of [
+    ['tasksFile', 'tasks.md'],
+    ['snapshotFile', 'execution-snapshot.md'],
+    ['reviewsFile', 'reviews.md'],
+  ]) {
+    if (fs.existsSync(paths[baseName])) {
+      moves.push({ src: relName, dst: path.join(target, relName), kind: 'file' })
+    }
+  }
+  if (fs.existsSync(paths.reviewsDir) && fs.statSync(paths.reviewsDir).isDirectory()) {
+    moves.push({ src: 'reviews', dst: path.join(target, 'reviews'), kind: 'dir' })
+  }
+  return moves
+}
+
+function computePlannedResets(current, closingBatch) {
+  return {
+    current_batch: closingBatch + 1,
+    batches_completed: [...normalizeArray(current.batches_completed), closingBatch],
+    batch_started_at: new Date().toISOString(),
+    active_tasks: [],
+    completed_task_ids: [],
+    draft_task_ids: [],
+    blocked_task_ids: [],
+    approved_task_ids: [],
+    open_questions: [],
+    execution_snapshot_revision: null,
+    approved_revision: null,
+    approved_by: null,
+    approved_at: null,
+    last_gate_question_id: null,
+    approval_reset_reason: null,
+    execution_authorized: false,
+    critic_status: 'not_offered',
+    phase: 'phase1_discovery',
+    subphase: 'scope_draft',
+    stage: 'planning',
+    phase1_revision: 1,
+    phase2_revision: 1,
+    plan_revision: 1,
+    phase1_approved_revision: null,
+    phase2_approved_revision: null,
+  }
+}
+
+export function planTransition({ projectDir, summary, incompleteTaskPolicy } = {}) {
+  if (!projectDir) throw new Error('planTransition requires projectDir')
+  const paths = transitionPaths(projectDir)
+  if (!fs.existsSync(paths.projectPath)) throw new Error(`planTransition: project.md missing at ${paths.projectPath}`)
+  const { frontmatter } = readMarkdownFrontmatter(paths.projectPath)
+  const current = withProjectDefaults(frontmatter)
+  const closingBatch = current.current_batch || 1
+  const newBatch = closingBatch + 1
+  return {
+    closing_batch: closingBatch,
+    new_batch: newBatch,
+    summary: summary || null,
+    policy: incompleteTaskPolicy ?? null,
+    incomplete_tasks: listIncompleteTasks(paths.tasksDir),
+    planned_moves: computePlannedMoves(paths, closingBatch),
+    planned_resets: computePlannedResets(current, closingBatch),
+    journal_path: paths.journalFile,
+    staging_dir: paths.stagingDir,
+    batch_dir: batchDir(projectDir, closingBatch),
+  }
+}
+
+function copyIntoStaging(projectDir, stagingDir, relativePath) {
+  const src = path.join(projectDir, relativePath)
+  if (!fs.existsSync(src)) return false
+  const dst = path.join(stagingDir, relativePath)
+  fs.mkdirSync(path.dirname(dst), { recursive: true })
+  const stat = fs.statSync(src)
+  if (stat.isDirectory()) {
+    fs.cpSync(src, dst, { recursive: true, force: true })
+  } else {
+    fs.copyFileSync(src, dst)
+  }
+  return true
+}
+
+function stageCurrentState(projectDir, plan, paths) {
+  fs.mkdirSync(plan.staging_dir, { recursive: true })
+  // Stage everything that the commit could touch, so rollback can fully
+  // restore even if commit started writing.
+  const candidates = [
+    'project.md',
+    'tasks',
+    'tasks.md',
+    'execution-snapshot.md',
+    'reviews.md',
+    'reviews',
+    'backlog.md',
+    'progress.md',
+    'batch-summary.md',
+  ]
+  for (const rel of candidates) {
+    copyIntoStaging(projectDir, plan.staging_dir, rel)
+  }
+}
+
+function writeJournal(journalPath, payload) {
+  writeJsonAtomic(journalPath, payload)
+}
+
+function readJournal(journalPath) {
+  if (!fs.existsSync(journalPath)) return null
+  try { return JSON.parse(fs.readFileSync(journalPath, 'utf8')) } catch { return null }
+}
+
+function moveIntoBatch(projectDir, move) {
+  const srcAbs = path.join(projectDir, move.src)
+  const dstAbs = path.join(projectDir, move.dst)
+  fs.mkdirSync(path.dirname(dstAbs), { recursive: true })
+  if (!fs.existsSync(srcAbs)) return false
+  fs.renameSync(srcAbs, dstAbs)
+  return true
+}
+
+function splitBacklogForArchive(projectDir, paths, closingBatch) {
+  // Keep 'now' + 'later' live; move 'done' + 'dropped' to archive. The
+  // backlog.md template uses ## Now, ## Later, ## Blocked, ## Dropped.
+  // Sections are identified by the `## ` headings.
+  if (!fs.existsSync(paths.backlogFile)) return
+  const content = fs.readFileSync(paths.backlogFile, 'utf8')
+  const match = content.match(/^(---\n[\s\S]*?\n---\n)([\s\S]*)$/)
+  const header = match ? match[1] : ''
+  const body = match ? match[2] : content
+
+  const sections = {}
+  let currentName = null
+  const preamble = []
+  for (const line of body.split(/\r?\n/)) {
+    const heading = line.match(/^##\s+(.+)$/)
+    if (heading) {
+      currentName = heading[1].trim().toLowerCase().split(/\s+/)[0]
+      sections[currentName] = [line]
+      continue
+    }
+    if (currentName == null) preamble.push(line)
+    else sections[currentName].push(line)
+  }
+
+  const liveNames = ['now', 'later', 'blocked']
+  const archivedNames = ['done', 'dropped']
+  const liveBody = [
+    ...preamble,
+    ...liveNames.flatMap((name) => sections[name] || []),
+  ].join('\n')
+  const archivedBody = archivedNames.flatMap((name) => sections[name] || []).join('\n').trim()
+
+  const liveFile = `${header}${liveBody.replace(/\n+$/, '')}\n`
+  writeMarkdown(paths.backlogFile, liveFile)
+
+  if (archivedBody) {
+    const archivePath = path.join(batchDir(projectDir, closingBatch), 'backlog-archived.md')
+    fs.mkdirSync(path.dirname(archivePath), { recursive: true })
+    writeMarkdown(archivePath, `${header}${archivedBody}\n`)
+  }
+}
+
+function rotateProgressFile(paths, closingBatch) {
+  if (!fs.existsSync(paths.progressFile)) return
+  const content = fs.readFileSync(paths.progressFile, 'utf8')
+  const match = content.match(/^(---\n[\s\S]*?\n---\n)([\s\S]*)$/)
+  const header = match ? match[1] : ''
+  const body = (match ? match[2] : content).replace(/^\s+|\s+$/g, '')
+  const openMarker = `<!-- batch ${closingBatch} archive -->`
+  const closeMarker = `<!-- end batch ${closingBatch} -->`
+  const wrapped = `${header}\n${openMarker}\n${body}\n${closeMarker}\n`
+  writeMarkdown(paths.progressFile, wrapped)
+}
+
+function appendBatchSummary(paths, closingBatch, summary) {
+  if (!fs.existsSync(paths.summaryFile)) {
+    // Render from template if available; otherwise create a minimal stub.
+    if (fs.existsSync(paths.summaryTemplate)) {
+      const tmpl = fs.readFileSync(paths.summaryTemplate, 'utf8')
+      const slug = path.basename(path.dirname(paths.summaryFile))
+      writeMarkdown(paths.summaryFile, renderTemplate(tmpl, { ACTIVE_PROJECT_SLUG: slug }))
+    } else {
+      writeMarkdown(paths.summaryFile, `---\nschema_version: 1\n---\n\n# Batches\n`)
+    }
+  }
+  const entry = [
+    ``,
+    `## Batch ${closingBatch}${summary ? ` — ${summary.split(/\r?\n/)[0]}` : ''}`,
+    ``,
+    `- Closed: ${new Date().toISOString()}`,
+    summary ? `- Summary: ${summary}` : `- Summary: (none provided)`,
+    ``,
+  ].join('\n')
+  fs.appendFileSync(paths.summaryFile, entry)
+}
+
+export function startNewBatch({ projectDir, summary, incompleteTaskPolicy } = {}) {
+  if (!projectDir) throw new Error('startNewBatch requires projectDir')
+  const paths = transitionPaths(projectDir)
+
+  // Step a: plan (pure).
+  const plan = planTransition({ projectDir, summary, incompleteTaskPolicy })
+
+  // Incomplete-task gate: T009 throws if policy is unset. T012 extends.
+  if (plan.incomplete_tasks.length > 0 && !incompleteTaskPolicy) {
+    throw new IncompleteTasksError(plan.incomplete_tasks)
+  }
+  if (incompleteTaskPolicy === 'cancel') {
+    throw new BatchCancelledError()
+  }
+
+  // Leftover-transition guard.
+  const existingJournal = readJournal(paths.journalFile)
+  if (existingJournal) throw new BatchTransitionInProgressError(existingJournal.status)
+
+  const lockAlreadyExists = fs.existsSync(paths.lockFile)
+  if (lockAlreadyExists) {
+    throw new BatchTransitionInProgressError('lock-held-without-journal')
+  }
+
+  // Step b: acquire lock.
+  acquireJsonLock(paths.lockFile, {
+    kind: 'batch_transition',
+    project_dir: projectDir,
+    closing_batch: plan.closing_batch,
+    new_batch: plan.new_batch,
+    pid: process.pid,
+    last_heartbeat_time: new Date().toISOString(),
+    stale_after_ms: STALE_TRANSITION_LOCK_MS,
+  })
+
+  try {
+    if (fs.existsSync(plan.batch_dir)) {
+      throw new Error(`batch ${plan.closing_batch} already archived at ${plan.batch_dir}`)
+    }
+
+    // Step c: stage pre-state.
+    if (fs.existsSync(plan.staging_dir)) fs.rmSync(plan.staging_dir, { recursive: true, force: true })
+    stageCurrentState(projectDir, plan, paths)
+
+    // Step d: write journal status='prepared'.
+    writeJournal(paths.journalFile, {
+      status: 'prepared',
+      closing_batch: plan.closing_batch,
+      new_batch: plan.new_batch,
+      summary: plan.summary,
+      policy: plan.policy,
+      planned_moves: plan.planned_moves,
+      planned_resets: plan.planned_resets,
+      staging_dir: plan.staging_dir,
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+    })
+
+    // Step e: update journal to 'committing' and perform mutations.
+    writeJournal(paths.journalFile, {
+      ...readJournal(paths.journalFile),
+      status: 'committing',
+      updated_at: new Date().toISOString(),
+    })
+
+    // Moves.
+    for (const move of plan.planned_moves) {
+      moveIntoBatch(projectDir, move)
+    }
+
+    // Incomplete-task policy handling. Runs AFTER moves so the archived files
+    // are what we mutate (abandon) or clone from (carry). Policy='cancel' is
+    // already handled above via BatchCancelledError before any mutation.
+    if (incompleteTaskPolicy === 'abandon' && plan.incomplete_tasks.length > 0) {
+      for (const task of plan.incomplete_tasks) {
+        const archivedPath = path.join(batchDir(projectDir, plan.closing_batch), 'tasks', path.basename(task.path))
+        if (!fs.existsSync(archivedPath)) continue
+        const content = fs.readFileSync(archivedPath, 'utf8')
+        fs.writeFileSync(archivedPath, rewriteTaskStageBlock(content, 'abandoned'))
+      }
+    }
+
+    if (incompleteTaskPolicy === 'carry' && plan.incomplete_tasks.length > 0) {
+      fs.mkdirSync(paths.tasksDir, { recursive: true })
+      let carryCounter = 0
+      for (const task of plan.incomplete_tasks) {
+        carryCounter += 1
+        const newBatch = plan.new_batch
+        const newId = `B${newBatch}-T${String(carryCounter).padStart(3, '0')}`
+        const archivedPath = path.join(batchDir(projectDir, plan.closing_batch), 'tasks', path.basename(task.path))
+        if (!fs.existsSync(archivedPath)) continue
+        const { frontmatter: archived, body: archivedBody } = readMarkdownFrontmatter(archivedPath)
+        const clonedFrontmatter = {
+          ...archived,
+          task_id: newId,
+          stage: 'draft',
+          // depends_on preserved VERBATIM per T012 contract — runtime does not
+          // consume dep edges today, so rewriting is YAGNI. Downstream tooling
+          // sees original batch IDs, which remain valid within archived batch
+          // references but won't exist in live tasks/ until separately carried.
+          depends_on: archived.depends_on,
+        }
+        const rippleNote = `\n\n## Carry origin\n\n- Original task_id: ${archived.task_id || task.task_id}\n- Original batch: ${plan.closing_batch}\n- Original stage at carry: ${task.stage}\n`
+        const clonedBody = (archivedBody || '') + rippleNote
+        const newPath = path.join(paths.tasksDir, `${newId}.md`)
+        writeMarkdownFrontmatter(newPath, clonedFrontmatter, clonedBody)
+      }
+    }
+
+    // Backlog split.
+    splitBacklogForArchive(projectDir, paths, plan.closing_batch)
+
+    // Progress rotation.
+    rotateProgressFile(paths, plan.closing_batch)
+
+    // Batch summary append.
+    appendBatchSummary(paths, plan.closing_batch, plan.summary)
+
+    // Project.md frontmatter resets (this is where batch fields first land
+    // on disk per T008's lazy-persistence contract).
+    updateMarkdownFrontmatter(paths.projectPath, ({ frontmatter, body }) => {
+      const nextFrontmatter = { ...frontmatter, ...plan.planned_resets }
+      return { frontmatter: nextFrontmatter, body }
+    })
+
+    // Step f: update journal to 'committed' (durability point).
+    writeJournal(paths.journalFile, {
+      ...readJournal(paths.journalFile),
+      status: 'committed',
+      updated_at: new Date().toISOString(),
+    })
+
+    // Step g: cleanup order is strict: staging → journal → lock.
+    fs.rmSync(plan.staging_dir, { recursive: true, force: true })
+    fs.unlinkSync(paths.journalFile)
+    releaseJsonLock(paths.lockFile)
+
+    return {
+      closing_batch: plan.closing_batch,
+      new_batch: plan.new_batch,
+      planned_moves: plan.planned_moves,
+    }
+  } catch (err) {
+    // Release the lock best-effort so recovery can re-acquire. Journal +
+    // staging remain for recoverInterruptedBatchTransition to inspect.
+    try { releaseJsonLock(paths.lockFile) } catch {}
+    throw err
+  }
+}
+
+function restoreFromStaging(projectDir, stagingDir) {
+  if (!fs.existsSync(stagingDir)) return
+  for (const entry of fs.readdirSync(stagingDir, { withFileTypes: true })) {
+    const src = path.join(stagingDir, entry.name)
+    const dst = path.join(projectDir, entry.name)
+    if (entry.isDirectory()) {
+      // Remove current dst then copy back.
+      if (fs.existsSync(dst)) fs.rmSync(dst, { recursive: true, force: true })
+      fs.cpSync(src, dst, { recursive: true, force: true })
+    } else if (entry.isFile()) {
+      fs.copyFileSync(src, dst)
+    }
+  }
+}
+
+export function recoverInterruptedBatchTransition({ projectDir } = {}) {
+  if (!projectDir) return { recovered: false, reason: 'no-project-dir' }
+  const paths = transitionPaths(projectDir)
+  const journal = readJournal(paths.journalFile)
+  const lockExists = fs.existsSync(paths.lockFile)
+
+  if (!journal && !lockExists) return { recovered: false, reason: 'no-transition-in-flight' }
+
+  if (!journal && lockExists) {
+    // No-journal-but-lock: cleanup ran past journal deletion. If the lock is
+    // stale, reclaim it; otherwise leave alone (could be a live holder).
+    const lockRaw = readJson(paths.lockFile)
+    const lastHeartbeat = lockRaw?.last_heartbeat_time || null
+    if (isStale(lastHeartbeat, STALE_TRANSITION_LOCK_MS)) {
+      releaseJsonLock(paths.lockFile)
+      return { recovered: true, action: 'stale-lock-reclaimed', status: null }
+    }
+    return { recovered: false, reason: 'live-lock-no-journal' }
+  }
+
+  const status = journal.status || 'prepared'
+  const stagingDir = journal.staging_dir || paths.stagingDir
+
+  if (status === 'committed') {
+    // Finalize: delete staging if present, delete journal, release lock.
+    if (fs.existsSync(stagingDir)) fs.rmSync(stagingDir, { recursive: true, force: true })
+    if (fs.existsSync(paths.journalFile)) fs.unlinkSync(paths.journalFile)
+    if (lockExists) releaseJsonLock(paths.lockFile)
+    return { recovered: true, action: 'finalize', status }
+  }
+
+  // status === 'prepared' or 'committing': roll back from staging.
+  restoreFromStaging(projectDir, stagingDir)
+  // Remove any partially-created batch dir.
+  const partialBatchDir = batchDir(projectDir, journal.closing_batch || 0)
+  if (fs.existsSync(partialBatchDir)) fs.rmSync(partialBatchDir, { recursive: true, force: true })
+  if (fs.existsSync(stagingDir)) fs.rmSync(stagingDir, { recursive: true, force: true })
+  if (fs.existsSync(paths.journalFile)) fs.unlinkSync(paths.journalFile)
+  if (lockExists) releaseJsonLock(paths.lockFile)
+  return { recovered: true, action: 'rollback', status }
 }

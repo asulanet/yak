@@ -719,6 +719,13 @@ export const PlanningFilesPlugin = async ({ directory }) => {
 
     // Build phase-aware directive block and place it at the TOP of the system
     // message list via unshift so it outranks default skills/agent descriptions.
+    // Surface prior-batch digest to phase1 when current_batch > 1. The digest
+    // lets a new-batch Phase 1 build on earlier batches without re-researching.
+    let batchSummary = null
+    try {
+      const summaryPath = path.join(runtimeSession.project_dir, 'batch-summary.md')
+      if (fs.existsSync(summaryPath)) batchSummary = fs.readFileSync(summaryPath, 'utf8')
+    } catch {}
     const phasePrompt = buildPhaseSystemPrompt({
       phase: frontmatter.phase,
       subphase: frontmatter.subphase,
@@ -728,6 +735,8 @@ export const PlanningFilesPlugin = async ({ directory }) => {
       activeTasks: frontmatter.active_tasks,
       openQuestions: frontmatter.open_questions,
       recordScriptPath: recordTaskStageScriptPath,
+      currentBatch: frontmatter.current_batch,
+      batchSummary,
     })
     output.system.unshift(phasePrompt)
 

@@ -18,6 +18,12 @@ function assertArrayField(frontmatter, key) {
 }
 
 function validateTaskSpecSchema(frontmatter) {
+  // task_id shape is NOT enforced by the schema validator — it's a normative
+  // convention for generators + CLI, enforced at the entry points (record-
+  // task-stage.mjs --task arg parser, carry/clone code added later). The
+  // canonical TASK_ID_PATTERN is exported from session-store.js for callers
+  // that want explicit validation via isValidTaskId. This keeps parseTask-
+  // Frontmatter tolerant of legacy fixtures and hand-crafted task files.
   assertRequiredField(frontmatter, 'task_id')
   assertRequiredField(frontmatter, 'plan_revision')
   assertRequiredField(frontmatter, 'approved_revision')

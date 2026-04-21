@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import path from 'path'
 import { findNearestGitRoot } from '../plugins/planning-files/root-resolution.js'
-import { getProjectDir, listProjects, projectExists, readActiveProjectSlug, recordTaskStage, sanitizeProjectSlug } from '../plugins/planning-files/session-store.js'
+import { getProjectDir, isValidTaskId, listProjects, projectExists, readActiveProjectSlug, recordTaskStage, sanitizeProjectSlug } from '../plugins/planning-files/session-store.js'
 
 function parseArgs(argv) {
   const positional = []
@@ -18,7 +18,7 @@ function parseArgs(argv) {
     if (arg === '--project' || arg === '-p') { projectSlug = argv[++i] || null; continue }
     if (arg === '--repo-root' || arg === '--repo') { repoArg = argv[++i] || null; continue }
     if (arg === '--help' || arg === '-h') {
-      console.log('Usage: record-task-stage --task <T###> --stage <stage> [--note "<text>"] [--project <slug>] [--repo-root <path>]')
+      console.log('Usage: record-task-stage --task <T### or B<N>-T###> --stage <stage> [--note "<text>"] [--project <slug>] [--repo-root <path>]')
       process.exit(0)
     }
     positional.push(arg)
@@ -43,7 +43,8 @@ function resolveProjectDir({ repoRoot, projectSlug }) {
 }
 
 const { taskId, stage, note, projectSlug, repoArg } = parseArgs(process.argv.slice(2))
-if (!taskId) throw new Error('record-task-stage: --task <T###> required')
+if (!taskId) throw new Error('record-task-stage: --task <T### or B<N>-T###> required')
+if (!isValidTaskId(taskId)) throw new Error(`record-task-stage: --task value must match canonical pattern (T### or B<N>-T###): ${JSON.stringify(taskId)}`)
 if (!stage) throw new Error('record-task-stage: --stage <stage> required')
 
 const cwd = process.cwd()

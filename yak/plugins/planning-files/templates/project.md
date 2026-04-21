@@ -23,6 +23,9 @@ critic_status: not_offered
 execution_authorized: false
 last_gate_question_id: null
 change_impact_level: local
+current_batch: 1
+batches_completed: []
+batch_started_at: null
 ---
 
 # Project

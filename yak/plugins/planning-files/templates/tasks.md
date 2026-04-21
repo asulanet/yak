@@ -11,6 +11,13 @@ review_mode: overview
 
 Project scope: {{ACTIVE_PROJECT_SLUG}}
 
+<!--
+Task-ID convention (multi-batch workflow):
+- Batch 1 uses bare `T###` IDs (legacy; no retroactive rename).
+- Batch 2 and later use the `B<N>-T###` prefix, per-batch reset numbering.
+When a new batch opens, this file archives into batches/<N>/tasks.md.
+-->
+
 | id | title | status | depends_on | unlocks | inputs | outputs | acceptance | expected_paths |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 

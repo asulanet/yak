@@ -104,21 +104,55 @@ function isAffirmativeApproval(answerText) {
   return /\b(approve|approved|yes|start|proceed|allow|ok|okay)\b/i.test(answerText)
 }
 
+// Regex patterns identifying Question shapes that are NOT phase-gate approvals.
+// These take priority over gate detection so (a) new-batch confirmations don't
+// get interpreted as phase approvals, and (b) incomplete-task policy prompts
+// (abandon/carry/cancel) don't accidentally trigger gates. This defends
+// against the gate-regex collision bug where a phase2 approval Question body
+// containing the phrase "authorize execution" was mis-routed to the execution
+// gate, silently approving execution of a stale task set. See findings.md +
+// batch-summary.md entries dated 2026-04-21 for the original incident.
+const NON_GATE_QUESTION_PATTERNS = [
+  /\bnew\s*-?\s*batch\b/i,             // "new batch" / "new-batch"
+  /\bstart\s+batch\s+\d/i,              // "start batch 2" / "Start batch N+1"
+  /\bnext\s+batch\b/i,                  // "next batch"
+  /\bkeep\s+adding\s+to\s+current/i,    // auto-detect "Keep adding to current batch"
+  /\b(abandon|carry|cancel)\b.*\btasks?\b/i, // incomplete-task policy
+  /\btasks?\b.*\b(abandon|carry|cancel)\b/i,
+]
+
+const PHASE2_GATE_PATTERN = /\b(phase\s*2|task review|task graph|task approval|approve tasks|approve task set|approve dag)\b/i
+const PHASE1_GATE_PATTERN = /\b(phase\s*1|workflow approval|design approval|discovery approval|scope approval|approve (the )?(plan|design|scope|workflow))\b/i
+const EXECUTION_GATE_PATTERN = /\b(execution|start coding|allow coding|allow implementation|begin implementation|authorize execution|run the approved tasks)\b/i
+
 export function detectGateRequest(candidate, _currentFrontmatter = {}) {
   const headerText = normalizeWhitespace((candidate?.questions || []).map((item) => item.header).filter(Boolean).join(' '))
   const questionText = normalizeWhitespace(candidate?.text)
   const combined = `${headerText} ${questionText}`.trim()
 
-  if (/\b(execution|start coding|allow coding|allow implementation|begin implementation|authorize execution|run the approved tasks)\b/i.test(combined)) {
-    return { gate: 'execution', subphase: 'execution_authorization' }
+  // Non-gate Questions short-circuit gate detection entirely. This avoids
+  // the situation where a Question legitimately about new-batch flow or
+  // incomplete-task policy gets routed to a phase gate because it happens to
+  // mention one of the gate keywords as prose.
+  for (const pattern of NON_GATE_QUESTION_PATTERNS) {
+    if (pattern.test(combined)) return null
   }
 
-  if (/\b(phase\s*2|task review|task graph|task approval|approve tasks|approve task set|approve dag)\b/i.test(combined)) {
+  // Priority: phase1 > phase2 > execution. The most specific / earliest-in-
+  // workflow gate wins when multiple match. Phase1 first protects against a
+  // phase1 Question whose body mentions "task graph" from being mis-routed
+  // to phase2. Phase2 then wins over execution to defend against the
+  // historical bug where phase2-approval Questions mentioning "authorize
+  // execution" in description prose got routed to the execution gate,
+  // auto-approving execution of a stale task set.
+  if (PHASE1_GATE_PATTERN.test(combined)) {
+    return { gate: 'phase1', subphase: 'phase1_approval' }
+  }
+  if (PHASE2_GATE_PATTERN.test(combined)) {
     return { gate: 'phase2', subphase: 'phase2_approval' }
   }
-
-  if (/\b(phase\s*1|workflow approval|design approval|discovery approval|scope approval|approve (the )?(plan|design|scope|workflow))\b/i.test(combined)) {
-    return { gate: 'phase1', subphase: 'phase1_approval' }
+  if (EXECUTION_GATE_PATTERN.test(combined)) {
+    return { gate: 'execution', subphase: 'execution_authorization' }
   }
 
   return null

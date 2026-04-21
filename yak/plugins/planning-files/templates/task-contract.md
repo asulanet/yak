@@ -22,6 +22,14 @@ escalation_rules: ["stop on plan drift", "stop when required path outside expect
 test_strategy: unspecified
 ---
 
+<!--
+Task-ID convention (multi-batch workflow):
+- Batch 1 tasks use bare `T###` (e.g. T001).
+- Batch 2+ tasks use `B<N>-T###` (e.g. B2-T001), with per-batch reset numbering.
+Both formats are accepted by the canonical TASK_ID_PATTERN exported from
+session-store.js.
+-->
+
 # {{TASK_ID}} — {{TASK_TITLE}}
 
 ## Goal

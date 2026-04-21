@@ -104,3 +104,17 @@ Each project folder contains machine-readable markdown artifacts:
 
 `yak/vendor/jsonc-parser.js` is a vendored lightweight parser shim used for Yak config parsing.
 It strips JSONC comments/trailing commas before `JSON.parse` and throws a clear `Invalid JSONC` error on failure.
+
+## Batches (multi-batch workflow)
+
+A workspace / Yak project can host multiple sequential "batches" — each batch is one full Phase 1→3 cycle. Shared memory (findings, context, progress, backlog 'later') carries across batches; batch-scoped artifacts (`tasks/`, `tasks.md`, `execution-snapshot.md`, `reviews.md`, `reviews/`) archive into `<project>/batches/<N>/` when a new batch opens. Batch-field persistence is lazy — legacy projects without `current_batch` on disk round-trip byte-identically until the first real transition materializes them.
+
+- **Task IDs**: Batch 1 uses bare `T###` (no retroactive rename). Batch 2+ uses `B<N>-T###` with per-batch reset numbering.
+- **Trigger phrases**: `/yak new`, `/yak new-batch`, `new yak`, `next yak batch`. Bare "new batch" is deliberately NOT a trigger (too generic for a global message hook).
+- **CLI**: `node yak/scripts/start-new-batch.mjs --summary "<text>" [--policy abandon|carry|cancel] [--dry-run] [--recover]`. Dry-run calls `planTransition` and renders the plan without mutations.
+- **Incomplete-task policies**: if the closing batch has tasks in non-terminal states, pick one — `abandon` (archive with stage rewritten to `abandoned`), `carry` (clone into new batch as `B<N+1>-T###` with `depends_on` preserved verbatim; no rewrite — runtime doesn't consume dep edges today), or `cancel` (abort the transition, no mutations).
+- **Crash safety**: the transition is journaled (`.batch-transition-journal.json`) with staging; crash mid-flow leaves the journal + staging behind, and `recoverInterruptedBatchTransition({projectDir})` rolls back or finalizes based on journal status.
+- **Phase 1 digest**: when `current_batch > 1`, the phase1 system prompt prepends the contents of `batch-summary.md` (truncated past `PHASE1_DIGEST_MAX_CHARS`) so scope discovery in the new batch builds on prior work.
+- **Gate-regex hardening**: Questions containing `new batch`, `start batch N`, or incomplete-task policy keywords (`abandon`/`carry`/`cancel` + `tasks`) are deliberately excluded from `detectGateRequest`. This prevents phase-gate auto-approval collisions discovered during the feature's own Phase 2.
+
+See `yak/docs/usage/strict-workflow.md` for the user-facing flow.
