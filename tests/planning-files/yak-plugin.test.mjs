@@ -1201,6 +1201,13 @@ function seedImplementingProject(repoRoot, taskIds = ['T1']) {
   return { projectDir, slug }
 }
 
+const TASK_BINDING_BLOCK_START = '======================<YAK_TASK_BINDING>======================'
+const TASK_BINDING_BLOCK_END = '======================<><><>======================'
+
+function taskBindingPrompt({ taskId, slug, projectDir, repoRoot, taskSpecPath = path.join(projectDir, 'tasks', `${taskId}.md`) }, body = 'Execute the spec') {
+  return `${TASK_BINDING_BLOCK_START}\ntask_id: ${JSON.stringify(taskId)}\nproject_slug: ${JSON.stringify(slug)}\nproject_dir: ${JSON.stringify(projectDir)}\nrepo_root: ${JSON.stringify(repoRoot)}\ntask_spec_path: ${JSON.stringify(taskSpecPath)}\n${TASK_BINDING_BLOCK_END}\n${body}`
+}
+
 test('orchestrator dispatching task tool auto-records dispatched stage for the bound task', async () => {
   const repoRoot = makeRepo(); const configRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'yak-config-'))
   await withEnv({ OPENCODE_CONFIG_DIR: configRoot, XDG_CONFIG_HOME: '' }, async () => {
@@ -1231,6 +1238,48 @@ test('orchestrator background_task dispatch also auto-records dispatched', async
   })
 })
 
+test('structured task-binding metadata block auto-records dispatched stage', async () => {
+  const repoRoot = makeRepo(); const configRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'yak-config-'))
+  await withEnv({ OPENCODE_CONFIG_DIR: configRoot, XDG_CONFIG_HOME: '' }, async () => {
+    const plugin = await PlanningFilesPlugin({ directory: repoRoot })
+    await plugin.event({ event: { type: 'session.created', properties: { info: { id: 'orch' } } } })
+    const { projectDir, slug } = seedImplementingProject(repoRoot, ['T1'])
+
+    await plugin['tool.execute.before']({ sessionID: 'orch', tool: 'task', callID: 'call-structured-1' }, { args: { subagent_type: 'fixer', description: 'impl T1', prompt: taskBindingPrompt({ taskId: 'T1', slug, projectDir, repoRoot }, 'Execute the spec at tasks/T1.md') } })
+
+    const { frontmatter } = readMarkdownFrontmatter(path.join(projectDir, 'tasks', 'T1.md'))
+    assert.equal(frontmatter.stage, 'dispatched', 'expected structured metadata binding to auto-advance T1 to dispatched')
+  })
+})
+
+test('structured task-binding metadata block rejects mismatched project metadata', async () => {
+  const repoRoot = makeRepo(); const configRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'yak-config-'))
+  await withEnv({ OPENCODE_CONFIG_DIR: configRoot, XDG_CONFIG_HOME: '' }, async () => {
+    const plugin = await PlanningFilesPlugin({ directory: repoRoot })
+    await plugin.event({ event: { type: 'session.created', properties: { info: { id: 'orch' } } } })
+    const { projectDir, slug } = seedImplementingProject(repoRoot, ['T1'])
+
+    await assert.rejects(
+      async () => plugin['tool.execute.before']({ sessionID: 'orch', tool: 'task', callID: 'call-structured-mismatch-1' }, { args: { subagent_type: 'fixer', description: 'impl T1', prompt: taskBindingPrompt({ taskId: 'T1', slug: `${slug}-wrong`, projectDir, repoRoot }, 'Execute the spec at tasks/T1.md') } }),
+      /project_slug|task binding/i,
+    )
+  })
+})
+
+test('structured task-binding metadata block rejects mismatched task path', async () => {
+  const repoRoot = makeRepo(); const configRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'yak-config-'))
+  await withEnv({ OPENCODE_CONFIG_DIR: configRoot, XDG_CONFIG_HOME: '' }, async () => {
+    const plugin = await PlanningFilesPlugin({ directory: repoRoot })
+    await plugin.event({ event: { type: 'session.created', properties: { info: { id: 'orch' } } } })
+    const { projectDir, slug } = seedImplementingProject(repoRoot, ['T1'])
+
+    await assert.rejects(
+      async () => plugin['tool.execute.before']({ sessionID: 'orch', tool: 'task', callID: 'call-structured-mismatch-2' }, { args: { subagent_type: 'fixer', description: 'impl T1', prompt: taskBindingPrompt({ taskId: 'T1', slug, projectDir, repoRoot, taskSpecPath: path.join(projectDir, 'tasks', 'T2.md') }, 'Execute the spec at tasks/T1.md') } }),
+      /task_spec_path|task binding/i,
+    )
+  })
+})
+
 test('task dispatch without taskID does not record any stage', async () => {
   const repoRoot = makeRepo(); const configRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'yak-config-'))
   await withEnv({ OPENCODE_CONFIG_DIR: configRoot, XDG_CONFIG_HOME: '' }, async () => {
@@ -1257,6 +1306,36 @@ test('task dispatch with unknown taskID does not crash and does not record', asy
     await assert.doesNotReject(async () => {
       await plugin['tool.execute.before']({ sessionID: 'orch', tool: 'task', callID: 'call-ghost' }, { args: { subagent_type: 'fixer', description: 'ghost', prompt: 'taskID: T99\nGhost task' } })
     })
+  })
+})
+
+test('dispatch prompt prose mentioning task name does not misbind english word', async () => {
+  const repoRoot = makeRepo(); const configRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'yak-config-'))
+  await withEnv({ OPENCODE_CONFIG_DIR: configRoot, XDG_CONFIG_HOME: '' }, async () => {
+    const plugin = await PlanningFilesPlugin({ directory: repoRoot })
+    await plugin.event({ event: { type: 'session.created', properties: { info: { id: 'orch' } } } })
+    const { projectDir } = seedImplementingProject(repoRoot, ['T1'])
+
+    await plugin['tool.execute.before']({ sessionID: 'orch', tool: 'task', callID: 'call-prose-1' }, { args: { subagent_type: 'fixer', description: 'impl T1', prompt: 'Work on task T1\nExecute the spec at tasks/T1.md' } })
+    await plugin.event({ event: { type: 'session.created', properties: { info: { id: 'worker-prose', parentID: 'orch' } } } })
+
+    await assert.doesNotReject(async () => {
+      await plugin['tool.execute.before']({ sessionID: 'worker-prose', tool: 'read', callID: 'call-read-prose-1' }, { args: { filePath: path.join(projectDir, 'tasks', 'T1.md') } })
+    })
+  })
+})
+
+test('malformed structured task-binding block fails closed', async () => {
+  const repoRoot = makeRepo(); const configRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'yak-config-'))
+  await withEnv({ OPENCODE_CONFIG_DIR: configRoot, XDG_CONFIG_HOME: '' }, async () => {
+    const plugin = await PlanningFilesPlugin({ directory: repoRoot })
+    await plugin.event({ event: { type: 'session.created', properties: { info: { id: 'orch' } } } })
+    seedImplementingProject(repoRoot, ['T1'])
+
+    await assert.rejects(
+      async () => plugin['tool.execute.before']({ sessionID: 'orch', tool: 'task', callID: 'call-malformed-1' }, { args: { subagent_type: 'fixer', description: 'impl T1', prompt: `${TASK_BINDING_BLOCK_START}\ntask_id: "T1"\nExecute the spec without a closing sentinel` } }),
+      /task binding|metadata|sentinel/i,
+    )
   })
 })
 
@@ -1374,5 +1453,9 @@ test('strict-phase3 orchestrator system prompt references yak_task_stage tool, n
     assert.match(joined, /yak_task_stage/i, 'orchestrator prompt should mention the tool name')
     assert.ok(!/node\s+\S*record-task-stage\.mjs/i.test(joined), 'orchestrator prompt must not reference the node CLI')
     assert.match(joined, /auto-recorded|automatically/i, 'orchestrator prompt should clarify dispatched/reported are auto-recorded')
+    assert.match(joined, /project_slug:/i, 'orchestrator prompt should show project_slug in task binding block')
+    assert.match(joined, /project_dir:/i, 'orchestrator prompt should show project_dir in task binding block')
+    assert.match(joined, /repo_root:/i, 'orchestrator prompt should show repo_root in task binding block')
+    assert.match(joined, /task_spec_path:/i, 'orchestrator prompt should show task_spec_path in task binding block')
   })
 })

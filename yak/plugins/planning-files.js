@@ -29,6 +29,8 @@ function loadTemplates(baseDir) {
 }
 function normalizeTaskID(value) { return typeof value === 'string' && value.trim() ? value.trim() : null }
 const PROJECT_GATE_FIELDS = new Set(['stage', 'phase', 'subphase', 'phase1_revision', 'phase1_approved_revision', 'phase2_revision', 'phase2_approved_revision', 'execution_snapshot_revision', 'approved_revision', 'approved_by', 'approved_at', 'execution_authorized', 'last_gate_question_id', 'change_impact_level'])
+const TASK_BINDING_BLOCK_START = '======================<YAK_TASK_BINDING>======================'
+const TASK_BINDING_BLOCK_END = '======================<><><>======================'
 
 function parseFrontmatterFromContent(content = '') {
   const match = String(content || '').match(/^---\n([\s\S]*?)\n---\n?/)
@@ -44,6 +46,127 @@ function parseFrontmatterFromContent(content = '') {
       return [key, raw]
     }
   }).filter(Boolean))
+}
+
+function parseLooseScalar(raw = '') {
+  const value = String(raw ?? '').trim()
+  if (!value) return ''
+  try {
+    return JSON.parse(value)
+  } catch {
+    return value
+  }
+}
+
+function parseStructuredTaskBindingBlock(source = '') {
+  if (typeof source !== 'string' || !source) return null
+  const lines = source.split(/\r?\n/)
+  const startIndex = lines.findIndex((line) => line.trim() === TASK_BINDING_BLOCK_START)
+  if (startIndex === -1) return null
+  const endIndex = lines.findIndex((line, index) => index > startIndex && line.trim() === TASK_BINDING_BLOCK_END)
+  if (endIndex === -1) throw new Error('Yak task binding metadata missing closing sentinel')
+  const block = {}
+  for (const rawLine of lines.slice(startIndex + 1, endIndex)) {
+    const line = rawLine.trim()
+    if (!line) continue
+    const separatorIndex = line.indexOf(':')
+    if (separatorIndex === -1) throw new Error(`Yak task binding metadata line missing separator: ${line}`)
+    const key = line.slice(0, separatorIndex).trim()
+    if (!key) throw new Error('Yak task binding metadata line missing key')
+    block[key] = parseLooseScalar(line.slice(separatorIndex + 1))
+  }
+  return block
+}
+
+function readBindingField(binding = {}, keys = []) {
+  for (const key of keys) {
+    const value = binding[key]
+    if (typeof value === 'string' && value.trim()) return value.trim()
+  }
+  return null
+}
+
+function buildStructuredTaskBindingBlock({ taskID, projectSlug, projectDir, repoRoot, taskSpecPath }) {
+  return [
+    TASK_BINDING_BLOCK_START,
+    `task_id: ${JSON.stringify(taskID)}`,
+    `project_slug: ${JSON.stringify(projectSlug)}`,
+    `project_dir: ${JSON.stringify(projectDir)}`,
+    `repo_root: ${JSON.stringify(repoRoot)}`,
+    `task_spec_path: ${JSON.stringify(taskSpecPath)}`,
+    TASK_BINDING_BLOCK_END,
+  ].join('\n')
+}
+
+function normalizeComparablePath(filePath) {
+  const resolved = path.resolve(filePath)
+  if (!fs.existsSync(resolved)) return resolved
+  try {
+    return fs.realpathSync.native(resolved)
+  } catch {
+    return resolved
+  }
+}
+
+function extractExplicitTaskBindingLine(source = '') {
+  if (typeof source !== 'string' || !source) return null
+  for (const rawLine of source.split(/\r?\n/)) {
+    const line = rawLine.trim()
+    if (!line) continue
+    for (const key of ['taskID', 'taskId', 'task_id']) {
+      if (line.startsWith(`${key}:`)) return normalizeTaskID(String(parseLooseScalar(line.slice(key.length + 1)) || ''))
+      if (line.startsWith(`${key}=`)) return normalizeTaskID(String(parseLooseScalar(line.slice(key.length + 1)) || ''))
+    }
+  }
+  return null
+}
+
+function describeTaskBindingFromArgs(args = {}) {
+  const direct = normalizeTaskID(args.taskID || args.taskId || args.task_id)
+  if (direct) return { taskID: direct, source: 'direct', metadata: null }
+  for (const source of [args.prompt, args.description]) {
+    if (typeof source !== 'string') continue
+    const structured = parseStructuredTaskBindingBlock(source)
+    if (structured) {
+      const taskID = normalizeTaskID(structured.task_id || structured.taskID || structured.taskId)
+      if (!taskID) throw new Error('Yak task binding metadata missing task_id')
+      return { taskID, source: 'structured', metadata: structured }
+    }
+    const explicit = extractExplicitTaskBindingLine(source)
+    if (explicit) return { taskID: explicit, source: 'legacy-line', metadata: null }
+  }
+  return null
+}
+
+function validateTaskBindingDescriptor(binding, runtimeSession) {
+  if (!binding) return null
+  if (binding.source !== 'structured') return binding.taskID
+  const metadata = binding.metadata || {}
+  const projectSlug = readBindingField(metadata, ['project_slug', 'projectSlug'])
+  const projectDir = readBindingField(metadata, ['project_dir', 'projectDir'])
+  const repoRootValue = readBindingField(metadata, ['repo_root', 'repoRoot'])
+  const taskSpecPath = readBindingField(metadata, ['task_spec_path', 'taskSpecPath'])
+  if (!projectSlug) throw new Error('Yak task binding metadata missing project_slug')
+  if (!projectDir) throw new Error('Yak task binding metadata missing project_dir')
+  if (!repoRootValue) throw new Error('Yak task binding metadata missing repo_root')
+  if (!taskSpecPath) throw new Error('Yak task binding metadata missing task_spec_path')
+
+  const expectedProjectSlug = runtimeSession?.active_project_slug || null
+  const expectedProjectDir = runtimeSession?.project_dir ? normalizeComparablePath(runtimeSession.project_dir) : null
+  const expectedRepoRoot = runtimeSession?.repo_root ? normalizeComparablePath(runtimeSession.repo_root) : null
+  const resolvedProjectDir = normalizeComparablePath(projectDir)
+  const resolvedRepoRoot = normalizeComparablePath(repoRootValue)
+  const resolvedTaskSpecPath = normalizeComparablePath(taskSpecPath)
+
+  if (expectedProjectSlug && projectSlug !== expectedProjectSlug) throw new Error(`Yak task binding metadata project_slug mismatch: expected ${expectedProjectSlug}, got ${projectSlug}`)
+  if (expectedProjectDir && resolvedProjectDir !== expectedProjectDir) throw new Error(`Yak task binding metadata project_dir mismatch: expected ${expectedProjectDir}, got ${resolvedProjectDir}`)
+  if (expectedRepoRoot && resolvedRepoRoot !== expectedRepoRoot) throw new Error(`Yak task binding metadata repo_root mismatch: expected ${expectedRepoRoot}, got ${resolvedRepoRoot}`)
+  if (path.basename(resolvedProjectDir) !== projectSlug) throw new Error(`Yak task binding metadata project_dir basename mismatch for project_slug ${projectSlug}`)
+
+  const expectedTaskSpecPath = normalizeComparablePath(path.join(resolvedProjectDir, 'tasks', `${binding.taskID}.md`))
+  if (resolvedTaskSpecPath !== expectedTaskSpecPath) throw new Error(`Yak task binding metadata task_spec_path mismatch: expected ${expectedTaskSpecPath}, got ${resolvedTaskSpecPath}`)
+  if (!fs.existsSync(resolvedTaskSpecPath)) throw new Error(`Yak task binding metadata task_spec_path missing: ${resolvedTaskSpecPath}`)
+  return binding.taskID
 }
 
 function extractGateFieldSubset(frontmatter = {}) {
@@ -66,14 +189,7 @@ function assertPlanningProjectGateFieldsUnchanged(projectFilePath, args = {}) {
   }
 }
 function extractTaskBindingFromArgs(args = {}) {
-  const direct = normalizeTaskID(args.taskID || args.taskId || args.task_id)
-  if (direct) return direct
-  for (const source of [args.prompt, args.description]) {
-    if (typeof source !== 'string') continue
-    const match = source.match(/(?:task[_\s-]*id\s*[:=]\s*|\b)(T[\w.-]+)/i)
-    if (match?.[1]) return match[1]
-  }
-  return null
+  return describeTaskBindingFromArgs(args)?.taskID || null
 }
 
 function resolveGatePhase(gate, currentPhase) {
@@ -150,7 +266,7 @@ export const PlanningFilesPlugin = async ({ directory }) => {
     return bindProject(opencodeSessionID, parent.active_project_slug, { role: 'worker', boundTaskID })
   }
   function rememberPendingTaskBinding(runtimeSession, args = {}) {
-    const taskID = extractTaskBindingFromArgs(args)
+    const taskID = validateTaskBindingDescriptor(describeTaskBindingFromArgs(args), runtimeSession)
     if (!taskID) return
     runtimeSession.pending_child_task_ids.push(taskID)
   }
@@ -167,6 +283,7 @@ export const PlanningFilesPlugin = async ({ directory }) => {
       }
     }
     const taskPath = path.join(projectDir, 'tasks', `${taskID}.md`)
+    if (!fs.existsSync(taskPath)) throw new Error(`Bound task ${taskID} resolved to missing task plan tasks/${taskID}.md`)
     const { frontmatter: taskFrontmatter } = readTaskPlan(taskPath)
     const parsed = parseTaskFrontmatter(taskFrontmatter)
     return {
@@ -416,7 +533,7 @@ export const PlanningFilesPlugin = async ({ directory }) => {
       // the fix that prevents subagent prompts from asking fixers/explorers to
       // run the record-task-stage CLI themselves — only the orchestrator
       // dispatches, so only the orchestrator sees this hook.
-      const dispatchedTaskID = extractTaskBindingFromArgs(args)
+      const dispatchedTaskID = validateTaskBindingDescriptor(describeTaskBindingFromArgs(args), runtimeSession)
       if (dispatchedTaskID && input.callID && !isExplorationStage(stage)) {
         runtimeSession.pending_task_dispatches.set(input.callID, dispatchedTaskID)
         try {
@@ -646,6 +763,9 @@ export const PlanningFilesPlugin = async ({ directory }) => {
     if (targetTaskID) {
       const taskFrontmatter = readTaskFrontmatterSafely(runtimeSession.project_dir, targetTaskID)
       if (taskFrontmatter) {
+        const taskSpecPath = path.join(runtimeSession.project_dir, 'tasks', `${targetTaskID}.md`)
+        const bindingBlock = buildStructuredTaskBindingBlock({ taskID: targetTaskID, projectSlug: runtimeSession.active_project_slug, projectDir: runtimeSession.project_dir, repoRoot, taskSpecPath })
+        output.system.push(`Yak dispatch binding: when dispatching task/background_task for bound task ${targetTaskID}, start prompt with:\n${bindingBlock}\nThen write the actual instructions below the block. Legacy exact lines like taskID: ${targetTaskID} still parse; free prose does not.`)
         const plan = resolveTaskModel({ task: taskFrontmatter, workflow: planning })
         if (plan.primary) {
           const effective = plan.primary
