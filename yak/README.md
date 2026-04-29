@@ -48,6 +48,7 @@ Arrays replace. Objects deep-merge. Scalars override.
   - explicit execution approval
 - When execution is authorized, Yak freezes the approved task set into `execution-snapshot.md`.
 - New ideas discovered during execution go to draft/backlog state, not the active execution snapshot.
+- Closed-batch handoff is confirm-first: Yak can preview and start a new batch through orchestrator-facing tools, while same-batch reopening remains a separate phase-reopen path.
 - Doc guide: `yak/docs/usage/strict-workflow.md`
 - Task contracts carry `task_id`, revision/stage metadata, routing hints, path policy, inputs/outputs, and acceptance fields.
 - Route fallback must set task-level `degraded_from` plus a visible progress log entry instead of failing silently.

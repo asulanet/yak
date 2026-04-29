@@ -10,6 +10,7 @@ Owns:
 - strict phase/subphase gate enforcement
 - execution snapshot freezing and task-binding helpers
 - question-tool approval capture and reusable clarification persistence
+- orchestrator-facing batch plan/start tools that delegate closed-batch handoff to the lifecycle engine
 
 Does not own:
 - global user policy (`AGENTS.md`)
@@ -31,5 +32,6 @@ Strict workflow docs:
 - Plan Critic states: offered, skipped, or recorded to completion
 - Phase 2: task DAG with one-by-one or approve-all review
 - Phase 3: frozen execution snapshot, no new-task rule
+- Batch handoff uses confirm-first closed-batch handling; same-batch reopen stays separate from next-batch start
 - Task contracts should carry revision, role, path, routing, inputs/outputs, acceptance, escalation, and test fields
 - Fallback routing must surface `degraded_from` plus a progress log entry to users

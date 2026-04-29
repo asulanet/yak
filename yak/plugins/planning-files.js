@@ -5,7 +5,7 @@ import { fileURLToPath } from 'url'
 
 import { findNearestGitRoot, ensureInsideRoot } from './planning-files/root-resolution.js'
 import { buildRepoWriteLeaseMetadata, getStaleAfterMs } from './planning-files/locks.js'
-import { appendProgress, bootstrapProjectArtifacts, ensureProjectArtifacts, getDefaultProjectSlug, getExecutionSnapshotPath, getProjectDir, getProjectFilePath, hasCanonicalProjectArtifacts, listProjects, migrateProjectFrontmatter, projectExists, readActiveProjectSlug, readProjectState, readTaskPlan, recordGateApproval, recordTaskModelOutcome, recordTaskStage, recoverProjectState, refreshProjectContext, sanitizeProjectSlug, setProjectPhase, stampTaskContract, summarizeDegradations, updateMarkdownFrontmatter, withProjectDefaults, writeActiveProjectSlug, writeExecutionSnapshot, writeLease, writeReviewsDegradationSection } from './planning-files/session-store.js'
+import { appendProgress, bootstrapProjectArtifacts, ensureProjectArtifacts, getDefaultProjectSlug, getExecutionSnapshotPath, getProjectDir, getProjectFilePath, hasCanonicalProjectArtifacts, listProjects, migrateProjectFrontmatter, planTransition, projectExists, readActiveProjectSlug, readProjectState, readTaskPlan, recordGateApproval, recordTaskModelOutcome, recordTaskStage, recoverProjectState, refreshProjectContext, sanitizeProjectSlug, setProjectPhase, startNewBatch, stampTaskContract, summarizeDegradations, updateMarkdownFrontmatter, withProjectDefaults, writeActiveProjectSlug, writeExecutionSnapshot, writeLease, writeReviewsDegradationSection } from './planning-files/session-store.js'
 import { assertApplyPatchAllowedForOrchestrator, assertApplyPatchAllowedForWorker, assertOrchestratorControlMkdirAllowed, assertOrchestratorControlWriteAllowed, assertPlanningWriteAllowed, assertScopedToolAllowed, assertTaskShellAllowed, assertTaskWriteAllowed, extractCandidatePaths, extractScopedToolTargets, hasForbiddenShellSyntax, isBlockedOrchestratorShellCommand, isAllowedReadonlyShell, isAllowedTestRunnerCommand, isDeniedPlanningTool, isExplorationStage, isMutatingTool, isPlanningStage, isOpenStage, parseApplyPatchPaths } from './planning-files/policy.js'
 import { clearQuestionRequest, recordQuestionResolution, rememberQuestionRequest } from './planning-files/persistence.js'
 import { detectGateApproval, detectGateRequest, extractTextFromParts, looksLikeFreeformQuestion } from './planning-files/question-findings.js'
@@ -463,7 +463,41 @@ export const PlanningFilesPlugin = async ({ directory }) => {
       })
     : null
 
-  return { ...(yakTaskStageTool ? { tool: { yak_task_stage: yakTaskStageTool } } : {}), offerPlanCriticForSession, recordPlanCriticResultForSession, skipPlanCriticForSession, recordTaskStageForSession, refreshDegradationSummaryForSession, activateYakForSession, deactivateYakForSession, event: async ({ event }) => {
+  const yakPlanNewBatchTool = opencodePluginApi.tool && opencodePluginApi.z
+    ? opencodePluginApi.tool({
+        description: 'Preview a Yak batch transition. ORCHESTRATOR ONLY — subagents must never call this tool. Returns dry-run metadata for the next batch without mutating files.',
+        args: {
+          summary: opencodePluginApi.z.string().optional().describe('Optional batch summary.'),
+          incomplete_task_policy: opencodePluginApi.z.enum(['abandon', 'carry', 'cancel']).optional().describe('Policy for incomplete tasks.'),
+        },
+        async execute(args, context) {
+          const rs = runtimeSessions.get(context?.sessionID) || (context?.sessionID ? bootstrapRuntimeSession(context.sessionID) : null)
+          if (!rs) throw new Error('yak_plan_new_batch: no active Yak project for this session')
+          if (rs.role !== 'orchestrator') throw new Error('yak_plan_new_batch: orchestrator role required — subagents must never plan batch transitions directly')
+          const plan = planTransition({ projectDir: rs.project_dir, summary: args.summary, incompleteTaskPolicy: args.incomplete_task_policy })
+          return { output: `Batch ${plan.closing_batch} -> ${plan.new_batch} preview`, metadata: plan }
+        },
+      })
+    : null
+
+  const yakStartNewBatchTool = opencodePluginApi.tool && opencodePluginApi.z
+    ? opencodePluginApi.tool({
+        description: 'Start a Yak batch transition. ORCHESTRATOR ONLY — subagents must never call this tool. Delegates to the lifecycle engine; no CLI shell-out.',
+        args: {
+          summary: opencodePluginApi.z.string().optional().describe('Optional batch summary.'),
+          incomplete_task_policy: opencodePluginApi.z.enum(['abandon', 'carry', 'cancel']).optional().describe('Policy for incomplete tasks.'),
+        },
+        async execute(args, context) {
+          const rs = runtimeSessions.get(context?.sessionID) || (context?.sessionID ? bootstrapRuntimeSession(context.sessionID) : null)
+          if (!rs) throw new Error('yak_start_new_batch: no active Yak project for this session')
+          if (rs.role !== 'orchestrator') throw new Error('yak_start_new_batch: orchestrator role required — subagents must never start batch transitions directly')
+          const result = startNewBatch({ projectDir: rs.project_dir, summary: args.summary, incompleteTaskPolicy: args.incomplete_task_policy })
+          return { output: `Batch ${result.closing_batch} -> ${result.new_batch} started`, metadata: result }
+        },
+      })
+    : null
+
+  return { ...(yakTaskStageTool ? { tool: { yak_task_stage: yakTaskStageTool, ...(yakPlanNewBatchTool ? { yak_plan_new_batch: yakPlanNewBatchTool } : {}), ...(yakStartNewBatchTool ? { yak_start_new_batch: yakStartNewBatchTool } : {}) } } : {}), offerPlanCriticForSession, recordPlanCriticResultForSession, skipPlanCriticForSession, recordTaskStageForSession, refreshDegradationSummaryForSession, activateYakForSession, deactivateYakForSession, event: async ({ event }) => {
     if (!planning.enabled || !repoRoot) return; const opencodeSessionID = event.properties?.sessionID || event.properties?.info?.id || event.properties?.id
     if (event.type === 'session.created') { if (!opencodeSessionID) return; const parentID = event.properties?.info?.parentID; if (parentID && inheritRuntimeSession(opencodeSessionID, parentID, event.properties?.info || {})) return; bootstrapRuntimeSession(opencodeSessionID); return }
     if (event.type === 'session.deleted') { if (!opencodeSessionID) return; runtimeSessions.delete(opencodeSessionID); return }

@@ -63,6 +63,15 @@ function describeList(items) {
   return arr.length === 0 ? 'none' : arr.join(', ')
 }
 
+function hasActiveTasks(activeTasks) {
+  return Array.isArray(activeTasks) && activeTasks.some((item) => item !== null && item !== undefined && String(item).length > 0)
+}
+
+function isClosedBatchExecutionBoundary({ phase, subphase, stage, activeTasks } = {}) {
+  const noActiveTasks = !hasActiveTasks(activeTasks)
+  return (phase === 'phase3_execution' && subphase === 'execution_complete' && noActiveTasks) || (stage === 'completed' && noActiveTasks)
+}
+
 function renderTemplate(template, replacements) {
   return Object.entries(replacements).reduce(
     (acc, [key, value]) => acc.replaceAll(`{{${key}}}`, String(value ?? '')),
@@ -94,7 +103,12 @@ export function buildPhaseSystemPrompt({ phase, subphase, stage, slug, projectDi
     return digest ? `${digest}\n${rendered}` : rendered
   }
   if (phase === 'phase2_tasks') return renderTemplate(PHASE2_TEMPLATE, replacements)
-  if (phase === 'phase3_execution') return renderTemplate(PHASE3_TEMPLATE, replacements)
+  if (phase === 'phase3_execution') {
+    const rendered = renderTemplate(PHASE3_TEMPLATE, replacements)
+    if (!isClosedBatchExecutionBoundary({ phase, subphase, stage, activeTasks })) return rendered
+    const nextBatch = Number(currentBatch) > 0 ? Number(currentBatch) + 1 : 2
+    return `${rendered}\n${renderTemplate(NEW_BATCH_AUTODETECT_CLAUSE, { NEXT_BATCH: nextBatch })}`
+  }
   return renderTemplate(PHASE0_TEMPLATE, replacements)
 }
 
